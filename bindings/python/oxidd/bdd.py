@@ -3,7 +3,7 @@
 __all__ = ["BDDManager", "BDDFunction"]
 
 import collections.abc
-from typing import Optional
+from typing import Optional, Union
 
 from _oxidd import ffi as _ffi
 from _oxidd import lib as _lib
@@ -16,6 +16,7 @@ class BDDManager(protocols.BooleanFunctionManager["BDDFunction"]):
     """Manager for binary decision diagrams (without complement edges)"""
 
     _mgr: ...  #: Wrapped FFI object (``oxidd_bdd_manager_t``)
+    _vars = []
 
     def __init__(self, inner_node_capacity: int, apply_cache_size: int, threads: int):
         """Create a new manager
@@ -48,8 +49,12 @@ class BDDManager(protocols.BooleanFunctionManager["BDDFunction"]):
         return hash(self._mgr._p)
 
     @override
-    def new_var(self) -> "BDDFunction":
-        return BDDFunction._from_raw(_lib.oxidd_bdd_new_var(self._mgr))
+    def new_var(self, name: Optional[str]=None) -> "BDDFunction":
+        if name == None:
+            name = "x" + str(len(self._vars))
+        var = BDDFunction._from_raw(_lib.oxidd_bdd_new_var(self._mgr))
+        self._vars.append((name, var))
+        return var
 
     @override
     def true(self) -> "BDDFunction":
@@ -62,6 +67,37 @@ class BDDManager(protocols.BooleanFunctionManager["BDDFunction"]):
     @override
     def num_inner_nodes(self) -> int:
         return _lib.oxidd_bdd_num_inner_nodes(self._mgr)
+    
+    
+    def visualize(self, func: Union["BDDFunction", list["BDDFunction"]], name: str = "viz", host: str = 'http://127.0.0.1:8080') -> None:
+        """Send the diagram to a host for visualization"""
+        if isinstance(func, BDDFunction):
+            func = [func]
+        vars = [var for (name, var) in self._vars]
+        var_names = [name for (name, var) in self._vars]
+        
+        
+        tmp_variables = [var._func for var in vars]
+        tmp_variable_names = [
+            _ffi.new("char[]", name.encode()) for name in var_names
+        ]
+        tmp_functions = [
+            f._func for f in func
+        ]
+        tmp_function_names = [
+            _ffi.new("char[]", "f{fi}".encode()) for fi in range(0, len(func))
+        ]
+
+        _lib.oxidd_bdd_visualize(
+            name.encode(),
+            host.encode(),
+            tmp_functions,
+            tmp_function_names,
+            len(tmp_functions),
+            tmp_variables,
+            tmp_variable_names,
+            len(tmp_variables),
+        )
 
 
 class BDDSubstitution:
@@ -158,6 +194,85 @@ class BDDFunction(
     def __ge__(self, other: Self) -> bool:
         """Same as ``not self < other``"""
         return (self._func._p, self._func._i) >= (other._func._p, other._func._i)
+    
+    def export_dddmp(
+        self,
+        dd_name: str,
+        filename: str,
+        function_name: str,
+        variables: list[Self],
+        variable_names: list[str],
+        as_ascii: bool,
+    ) -> None:
+        """Export the decision diagram in to filename in DDDMP format"""
+        tmp_variables = [var._func for var in variables]
+        tmp_variable_names = [
+            _ffi.new("char[]", name.encode()) for name in variable_names
+        ]
+
+        _lib.oxidd_bdd_export_dddmp(
+            self._func,
+            filename.encode(),
+            dd_name.encode(),
+            function_name.encode(),
+            tmp_variables,
+            tmp_variable_names,
+            len(variables),
+            as_ascii,
+        )
+
+    def export_dot(
+        self,
+        filename: str,
+        function_name: str,
+        variables: list[Self],
+        variable_names: list[str],
+    ):
+        """Export the decision diagram in to filename in Graphviz dot format"""
+        tmp_variables = [var._func for var in variables]
+        tmp_variable_names = [
+            _ffi.new("char[]", name.encode()) for name in variable_names
+        ]
+
+        _lib.oxidd_bdd_export_dot(
+            self._func,
+            filename.encode(),
+            function_name.encode(),
+            tmp_variables,
+            tmp_variable_names,
+            len(variables),
+        )
+        
+    def visualize(
+        self,
+        function_name: str,
+        variables: list[Self],
+        variable_names: list[str],
+        name: str = "viz", 
+        host: str = 'http://127.0.0.1:8080'
+    ):
+        """Send the diagram to a host for visualization"""
+        tmp_variables = [var._func for var in variables]
+        tmp_variable_names = [
+            _ffi.new("char[]", name.encode()) for name in variable_names
+        ]
+        tmp_functions = [
+            self._func
+        ]
+        tmp_function_names = [
+            _ffi.new("char[]", function_name.encode())
+        ]
+
+        _lib.oxidd_bdd_visualize(
+            name.encode(),
+            host.encode(),
+            tmp_functions,
+            tmp_function_names,
+            len(tmp_functions),
+            tmp_variables,
+            tmp_variable_names,
+            len(variables),
+        )
 
     @override
     def __hash__(self) -> int:
@@ -367,3 +482,4 @@ class BDDFunction(
             c_arg.val = v
 
         return bool(_lib.oxidd_bdd_eval(self._func, c_args, n))
+

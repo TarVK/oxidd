@@ -32,12 +32,18 @@ is_sorted = { version = "0.1", optional = true }
 # document feature flags
 document-features = "0.2"
 
+# for communicating with visualization tool
+minreq = { version = "2.12.0", optional = true }
+
 
 [features]
-default = ["dddmp", "dot"]
+default = ["dddmp", "dot", "visualize"]
 
 ## DDDMP format originally from CUDD
 dddmp = ["bitvec", "rustc-hash", "memchr", "is_sorted"]
 
 ## Visualization using dot
 dot = []
+
+## Visualization using viz tool
+visualize = ["minreq"]

@@ -49,3 +49,5 @@ __pycache__/
 /CMakeSettings.json
 # CLion/… project configuration
 /.idea
+
+.venv

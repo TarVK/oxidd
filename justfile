@@ -69,7 +69,10 @@ devtools-py-venv-warn:
 # Install Python development tools
 devtools-py: devtools-py-venv && devtools-py-venv-warn
     #!/bin/sh
-    if [ "$VIRTUAL_ENV" = '' ]; then source .venv/bin/activate; fi
+    if [ "$VIRTUAL_ENV" = '' ]; then 
+        if [[ $(uname -s) == CYGWIN* ]]; then source .venv/Scripts/activate;
+        else source .venv/bin/activate; fi
+    fi
     pip3 install --upgrade pip pyright ruff sphinx pydata-sphinx-theme pytest-cov
     pip3 install --editable .
 

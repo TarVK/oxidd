@@ -19,7 +19,7 @@ oxidd-manager-index = { workspace = true, optional = true }
 oxidd-manager-pointer = { workspace = true, optional = true }
 oxidd-cache = { workspace = true, features = ["hugealloc"], optional = true }
 oxidd-derive.workspace = true
-oxidd-dump.workspace = true
+oxidd-dump = { workspace = true, features = ["visualize"] }
 oxidd-reorder.workspace = true
 oxidd-rules-bdd = { workspace = true, optional = true }
 oxidd-rules-mtbdd = { workspace = true, optional = true }

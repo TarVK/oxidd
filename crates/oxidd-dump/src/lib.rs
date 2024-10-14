@@ -14,3 +14,6 @@ pub mod dddmp;
 
 #[cfg(feature = "dot")]
 pub mod dot;
+
+#[cfg(feature = "visualize")]
+pub mod visualize;
