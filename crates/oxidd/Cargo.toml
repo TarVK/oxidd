@@ -46,6 +46,9 @@ default = [
 ]
 
 ## Enable the simple BDD implementation
+oxidd-rules-bdd = [
+  "dep:oxidd-rules-bdd",
+] # Fix for https://github.com/rust-lang/cargo/issues/10788
 bdd = ["dep:oxidd-rules-bdd", "oxidd-rules-bdd/simple"]
 
 ## Enable the complement edge BDD implementation
