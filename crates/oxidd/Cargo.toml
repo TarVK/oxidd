@@ -42,6 +42,7 @@ default = [
   "mtbdd",
   "zbdd",
   "multi-threading",
+  "oxidd-cache",               # Fix for https://github.com/rust-lang/cargo/issues/10788
   "apply-cache-direct-mapped",
 ]
 
