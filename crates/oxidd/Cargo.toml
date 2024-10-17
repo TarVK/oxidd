@@ -42,7 +42,6 @@ default = [
   "mtbdd",
   "zbdd",
   "multi-threading",
-  "oxidd-cache",               # Fix for https://github.com/rust-lang/cargo/issues/10788
   "apply-cache-direct-mapped",
 ]
 
@@ -85,6 +84,9 @@ manager-index = ["dep:oxidd-manager-index"]
 manager-pointer = ["dep:oxidd-manager-pointer"]
 
 ## Enable the direct mapped apply cache
+oxidd-cache = [
+  "dep:oxidd-cache",
+] # Fix for https://github.com/rust-lang/cargo/issues/10788
 apply-cache-direct-mapped = ["dep:oxidd-cache", "oxidd-cache/direct"]
 
 ## Enable statistics (will harm performance)
