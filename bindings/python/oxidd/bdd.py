@@ -69,24 +69,84 @@ class BDDManager(protocols.BooleanFunctionManager["BDDFunction"]):
         return _lib.oxidd_bdd_num_inner_nodes(self._mgr)
     
     
-    def visualize(self, func: Union["BDDFunction", list["BDDFunction"]], name: str = "viz", host: str = 'http://127.0.0.1:8080') -> None:
-        """Send the diagram to a host for visualization"""
-        if isinstance(func, BDDFunction):
-            func = [func]
-        vars = [var for (name, var) in self._vars]
-        var_names = [name for (name, var) in self._vars]
-        
-        
-        tmp_variables = [var._func for var in vars]
-        tmp_variable_names = [
-            _ffi.new("char[]", name.encode()) for name in var_names
-        ]
-        tmp_functions = [
-            f._func for f in func
-        ]
-        tmp_function_names = [
-            _ffi.new("char[]", "f{fi}".encode()) for fi in range(0, len(func))
-        ]
+    def export_dddmp(
+        self,
+        filename: str,
+        func: Union[
+            Union["BDDFunction", tuple[str, "BDDFunction"]], 
+            list[Union["BDDFunction", tuple[str, "BDDFunction"]]]
+        ], 
+        dd_name: str = "viz",
+        as_ascii: bool = True,
+    ) -> None:
+        """
+            Export the decision diagram in to filename in DDDMP format.
+            Multiple formats are allowed for `func` given some function `f` and `g`:
+            - f
+            - ("func_name", f)
+            - [f, g]
+            - [("func_name1", f), ("func_name2", g)]
+        """
+        tmp_functions, tmp_function_names, tmp_variables, tmp_variable_names = get_func_data(func, self._vars)
+
+        _lib.oxidd_bdd_export_dddmp(
+            filename.encode(),
+            dd_name.encode(),
+            tmp_functions,
+            tmp_function_names,
+            len(tmp_functions),
+            tmp_variables,
+            tmp_variable_names,
+            len(tmp_variables),
+            as_ascii,
+        )
+
+    def export_dot(
+        self,
+        filename: str, 
+        func: Union[
+            Union["BDDFunction", tuple[str, "BDDFunction"]], 
+            list[Union["BDDFunction", tuple[str, "BDDFunction"]]]
+        ], 
+    ):
+        """
+            Export the decision diagram in to filename in Graphviz dot format.
+            Multiple formats are allowed for `func` given some function `f` and `g`:
+            - f
+            - ("func_name", f)
+            - [f, g]
+            - [("func_name1", f), ("func_name2", g)]
+        """
+        tmp_functions, tmp_function_names, tmp_variables, tmp_variable_names = get_func_data(func, self._vars)
+
+        _lib.oxidd_bdd_export_dot(
+            filename.encode(),
+            tmp_functions,
+            tmp_function_names,
+            len(tmp_functions),
+            tmp_variables,
+            tmp_variable_names,
+            len(tmp_variables),
+        )
+
+    def visualize(
+        self, 
+        func: Union[
+            Union["BDDFunction", tuple[str, "BDDFunction"]], 
+            list[Union["BDDFunction", tuple[str, "BDDFunction"]]]
+        ], 
+        name: str = "viz", 
+        host: str = 'http://127.0.0.1:8080'
+    ) -> None:
+        """
+            Send the diagram to a host for visualization.
+            Multiple formats are allowed for `func` given some function `f` and `g`:
+            - f
+            - ("func_name", f)
+            - [f, g]
+            - [("func_name1", f), ("func_name2", g)]
+        """
+        tmp_functions, tmp_function_names, tmp_variables, tmp_variable_names = get_func_data(func, self._vars)
 
         _lib.oxidd_bdd_visualize(
             name.encode(),
@@ -98,6 +158,41 @@ class BDDManager(protocols.BooleanFunctionManager["BDDFunction"]):
             tmp_variable_names,
             len(tmp_variables),
         )
+
+def get_func_data(
+    func: Union[
+        Union["BDDFunction", tuple[str, "BDDFunction"]], 
+        list[Union["BDDFunction", tuple[str, "BDDFunction"]]]
+    ],
+    inp_vars: list[tuple[str, "BDDFunction"]]
+):
+    funcs = func if isinstance(func, list) else [func]
+    named_funcs = [
+        ((f'f{i}', f) if isinstance(f, BDDFunction) else f) 
+        for (i, f) in enumerate(funcs)
+    ]
+
+    vars = [var for (name, var) in inp_vars]
+    var_names = [name for (name, var) in inp_vars]
+    
+    
+    tmp_variables = [var._func for var in vars]
+    tmp_variable_names = [
+        _ffi.new("char[]", name.encode()) for name in var_names
+    ]
+    tmp_functions = [
+        f._func for (_, f) in named_funcs
+    ]
+    tmp_function_names = [
+        _ffi.new("char[]", name.encode()) for (name, _) in named_funcs
+    ]
+    return (
+        tmp_functions,
+        tmp_function_names,
+        tmp_variables,
+        tmp_variable_names
+    )
+
 
 
 class BDDSubstitution:
@@ -209,12 +304,19 @@ class BDDFunction(
         tmp_variable_names = [
             _ffi.new("char[]", name.encode()) for name in variable_names
         ]
+        tmp_functions = [
+            self._func
+        ]
+        tmp_function_names = [
+            _ffi.new("char[]", function_name.encode())
+        ]
 
         _lib.oxidd_bdd_export_dddmp(
-            self._func,
             filename.encode(),
             dd_name.encode(),
-            function_name.encode(),
+            tmp_functions,
+            tmp_function_names,
+            len(tmp_functions),
             tmp_variables,
             tmp_variable_names,
             len(variables),
@@ -233,11 +335,18 @@ class BDDFunction(
         tmp_variable_names = [
             _ffi.new("char[]", name.encode()) for name in variable_names
         ]
+        tmp_functions = [
+            self._func
+        ]
+        tmp_function_names = [
+            _ffi.new("char[]", function_name.encode())
+        ]
 
         _lib.oxidd_bdd_export_dot(
-            self._func,
             filename.encode(),
-            function_name.encode(),
+            tmp_functions,
+            tmp_function_names,
+            len(tmp_functions),
             tmp_variables,
             tmp_variable_names,
             len(variables),
