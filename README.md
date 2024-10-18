@@ -15,23 +15,23 @@ There are several dependencies for this to work, that you have have to install:
 - [cargo](https://doc.rust-lang.org/cargo/getting-started/index.html) (a recent version, e.g. 1.81.0)
 - [cbindgen](https://github.com/mozilla/cbindgen)
 
-Besides this, you might need to create and activate a [virtual python environment](https://www.freecodecamp.org/news/how-to-setup-virtual-environments-in-python/).
+Besides this, you might need to create and activate a [virtual Python environment](https://www.freecodecamp.org/news/how-to-setup-virtual-environments-in-python/).
 
-Install the python bindings present in this fork on Windows with the command:
+Install the Python bindings present in this fork on Windows with the command:
 
 ```txt
 python -m pip install "oxidd @ git+https://git@github.com/TarVK/oxidd.git"
 ```
 
-On mac or Linux instead use:
+On Mac or Linux instead use:
 
 ```txt
 OXIDD_PYFFI_LINK_MODE=static python -m pip install "oxidd @ git+https://git@github.com/TarVK/oxidd.git"
 ```
 
-Of course if you have pip installed on its own, you might need to omit "python -m" from the command, or if python is called differently (e.g. "py" or "python3") you will need to use the name instead.
+Of course if you have pip installed on its own, you might need to omit "python -m" from the command, or if Python is called differently (e.g. "py" or "python3") you will need to use the name instead.
 
-AFter successful installation, Python bindings should be available. If the visualization tool is running, you should now be able to run the following script:
+After successful installation, Python bindings should be available. With the visualization tool is running, you should now be able to execute scripts with visualization calls:
 
 ```py
 import oxidd
@@ -56,14 +56,14 @@ mgr.export_dddmp("test.dddmp", [("w", w)]) # Export as dddmp file
 
 ### Rust
 
-Add this oxidd fork as a dependency to your rust project. It should look something like:
+Add this OxiDD fork as a dependency to your Rust project. It should look something like:
 
 ```toml
 [dependencies]
 oxidd = { git = "https://github.com/TarVK/oxidd", branch = "main" }
 ```
 
-Now with the visualization tool running, your rust code should be able to make calls like this:
+Now with the visualization tool running, your Rust code should be able make visualization calls:
 
 ```rust
 use oxidd::bdd::BDDFunction;
