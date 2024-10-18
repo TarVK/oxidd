@@ -54,9 +54,9 @@ mgr.export_dot("test.dot", [("f", f)]) # Export as dot file
 mgr.export_dddmp("test.dddmp", [("w", w)]) # Export as dddmp file
 ```
 
-### Oxidd
+### Rust
 
-Add this oxidd fork as a dependency to your project. It should look something like:
+Add this oxidd fork as a dependency to your rust project. It should look something like:
 
 ```toml
 [dependencies]
