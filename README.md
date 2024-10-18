@@ -12,8 +12,8 @@ OxiDD is a highly modular decision diagram framework written in Rust. The most p
 
 There are several dependencies for this to work, that you have have to install:
 
+- [cargo](https://doc.rust-lang.org/cargo/getting-started/index.html) (a recent version, e.g. 1.81.0)
 - [cbindgen](https://github.com/mozilla/cbindgen)
-- [cargo](https://doc.rust-lang.org/cargo/getting-started/index.html)
 
 Besides this, you might need to create and activate a [virtual python environment](https://www.freecodecamp.org/news/how-to-setup-virtual-environments-in-python/).
 
