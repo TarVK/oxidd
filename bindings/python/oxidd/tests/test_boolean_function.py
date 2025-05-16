@@ -481,7 +481,7 @@ def test_bdd_export() -> None:
     y = mgr.new_var()
     z = mgr.new_var()
     f = x.imp(y | z)
-    mgr.dump_dddmp_file("test.dddmmp", [(f, "f")], [(x, "x"), (y, "y"), (z, "z")])
+    mgr.dump_dddmp_file("bdd_test.dddmmp", [(f, "f")], [(x, "x"), (y, "y"), (z, "z")])
 
 
 def test_bdd_visualize() -> None:
@@ -491,6 +491,36 @@ def test_bdd_visualize() -> None:
     z = mgr.new_var()
     f = x.imp(y | z)
     mgr.visualize([(f, "f")], [(x, "x"), (y, "y"), (z, "z")])
+
+
+def test_zbdd_export() -> None:
+    mgr = oxidd.zbdd.ZBDDManager(1024, 1024, 1)
+    singletons = [mgr.new_singleton() for _ in range(3)]
+    x0 = singletons[0].var_boolean_function()
+    x1 = singletons[1].var_boolean_function()
+    x2 = singletons[2].var_boolean_function()
+    f = x0.imp(x1 | x2)
+    mgr.dump_dddmp_file("zbdd_test.dddmmp", [(f, "f")], [(singletons[i], "x"+str(i)) for i in range(3)])
+
+
+def test_zbdd_visualize() -> None:
+    mgr = oxidd.zbdd.ZBDDManager(1024, 1024, 1)
+    singletons = [mgr.new_singleton() for _ in range(3)]
+    x0 = singletons[0].var_boolean_function()
+    x1 = singletons[1].var_boolean_function()
+    x2 = singletons[2].var_boolean_function()
+    f = x0.imp(x1 | x2)
+    mgr.visualize([(f, "f")], [(singletons[i], "x"+str(i)) for i in range(3)])
+
+
+def test_zbdd_dot() -> None:
+    mgr = oxidd.zbdd.ZBDDManager(1024, 1024, 1)
+    singletons = [mgr.new_singleton() for _ in range(3)]
+    x0 = singletons[0].var_boolean_function()
+    x1 = singletons[1].var_boolean_function()
+    x2 = singletons[2].var_boolean_function()
+    f = x0.imp(x1 | x2)
+    mgr.dump_all_dot_file("zbdd_test.dot", [(f, "f")], [(singletons[i], "x"+str(i)) for i in range(3)])
 
 
 def test_bdd_pick_cube() -> None:

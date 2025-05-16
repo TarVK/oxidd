@@ -159,7 +159,7 @@ impl BDDManager {
     /// Returns:
     ///     None
     #[pyo3(
-        signature = (/, path, functions, variables, dd_name= "",  ascii=true),
+        signature = (/, path, functions, variables, dd_name= "bdd",  ascii=true),
         text_signature = "($self, /, path, functions, variables, dd_name='', ascii=True)"
     )]
     fn dump_dddmp_file<'py>(
