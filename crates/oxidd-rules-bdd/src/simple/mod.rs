@@ -5,9 +5,8 @@ use std::fmt;
 use std::hash::Hash;
 
 use oxidd_core::util::{AllocResult, Borrowed};
-use oxidd_core::{DiagramRules, Edge, HasLevel, InnerNode, LevelNo, Manager, Node, ReducedOrNew};
+use oxidd_core::{DiagramRules, Edge, InnerNode, LevelNo, Manager, Node, ReducedOrNew};
 use oxidd_derive::Countable;
-use oxidd_dump::dddmp::AsciiDisplay;
 
 use crate::stat;
 
@@ -19,10 +18,13 @@ mod apply_rec;
 pub struct BDDRules;
 
 impl<E: Edge, N: InnerNode<E>> DiagramRules<E, N, BDDTerminal> for BDDRules {
-    type Cofactors<'a> = N::ChildrenIter<'a> where N: 'a, E: 'a;
+    type Cofactors<'a>
+        = N::ChildrenIter<'a>
+    where
+        N: 'a,
+        E: 'a;
 
     #[inline(always)]
-    #[must_use]
     fn reduce<M: Manager<Edge = E, InnerNode = N>>(
         manager: &M,
         level: LevelNo,
@@ -42,40 +44,39 @@ impl<E: Edge, N: InnerNode<E>> DiagramRules<E, N, BDDTerminal> for BDDRules {
     }
 
     #[inline(always)]
-    #[must_use]
     fn cofactors(_tag: E::Tag, node: &N) -> Self::Cofactors<'_> {
         node.children()
     }
 
     #[inline(always)]
-    fn cofactor(_tag: E::Tag, node: &N, n: usize) -> Borrowed<E> {
+    fn cofactor(_tag: E::Tag, node: &N, n: usize) -> Borrowed<'_, E> {
         node.child(n)
     }
 }
 
 /// Apply the reduction rules, creating a node in `manager` if necessary
 #[inline(always)]
-fn reduce<M>(
-    manager: &M,
-    level: LevelNo,
-    t: M::Edge,
-    e: M::Edge,
-    _op: BDDOp,
-) -> AllocResult<M::Edge>
+fn reduce<M>(manager: &M, level: LevelNo, t: M::Edge, e: M::Edge, op: BDDOp) -> AllocResult<M::Edge>
 where
     M: Manager<Terminal = BDDTerminal>,
 {
-    let tmp = <BDDRules as DiagramRules<_, _, _>>::reduce(manager, level, [t, e]);
-    if let ReducedOrNew::Reduced(..) = &tmp {
-        stat!(reduced _op);
+    // We do not use `DiagramRules::reduce()` here, as the iterator is
+    // apparently not fully optimized away.
+    if t == e {
+        stat!(reduced op);
+        manager.drop_edge(e);
+        return Ok(t);
     }
-    tmp.then_insert(manager, level)
+    oxidd_core::LevelView::get_or_insert(
+        &mut manager.level(level),
+        M::InnerNode::new(level, [t, e]),
+    )
 }
 
 /// Collect the two children of a binary node
 #[inline]
 #[must_use]
-fn collect_children<E: Edge, N: InnerNode<E>>(node: &N) -> (Borrowed<E>, Borrowed<E>) {
+fn collect_children<E: Edge, N: InnerNode<E>>(node: &N) -> (Borrowed<'_, E>, Borrowed<'_, E>) {
     debug_assert_eq!(N::ARITY, 2);
     let mut it = node.children();
     let f_then = it.next().unwrap();
@@ -100,19 +101,18 @@ pub enum BDDTerminal {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParseTerminalErr;
 
-impl std::str::FromStr for BDDTerminal {
-    type Err = ParseTerminalErr;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "t" | "T" | "true" | "True" | "TRUE" | "⊤" => Ok(BDDTerminal::True),
-            "f" | "F" | "false" | "False" | "FALSE" | "⊥" => Ok(BDDTerminal::False),
-            _ => Err(ParseTerminalErr),
-        }
+impl<Tag: Default> oxidd_dump::ParseTagged<Tag> for BDDTerminal {
+    fn parse(s: &str) -> Option<(Self, Tag)> {
+        let val = match s {
+            "t" | "T" | "true" | "True" | "TRUE" | "⊤" | "1" => BDDTerminal::True,
+            "f" | "F" | "false" | "False" | "FALSE" | "⊥" | "0" => BDDTerminal::False,
+            _ => return None,
+        };
+        Some((val, Tag::default()))
     }
 }
 
-impl AsciiDisplay for BDDTerminal {
+impl oxidd_dump::AsciiDisplay for BDDTerminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
             BDDTerminal::False => f.write_str("F"),
@@ -283,7 +283,7 @@ pub enum BDDOp {
     /// Forall quantification
     Forall,
     /// Existential quantification
-    Exist,
+    Exists,
     /// Unique quantification
     Unique,
 
@@ -296,14 +296,14 @@ pub enum BDDOp {
     ForallImp,
     ForallImpStrict,
 
-    ExistAnd,
-    ExistOr,
-    ExistNand,
-    ExistNor,
-    ExistXor,
-    ExistEquiv,
-    ExistImp,
-    ExistImpStrict,
+    ExistsAnd,
+    ExistsOr,
+    ExistsNand,
+    ExistsNor,
+    ExistsXor,
+    ExistsEquiv,
+    ExistsImp,
+    ExistsImpStrict,
 
     UniqueAnd,
     UniqueOr,
@@ -331,14 +331,14 @@ impl BDDOp {
             }
         } else if q == BDDOp::Or as u8 {
             match () {
-                _ if op == BDDOp::And as u8 => BDDOp::ExistAnd,
-                _ if op == BDDOp::Or as u8 => BDDOp::ExistOr,
-                _ if op == BDDOp::Nand as u8 => BDDOp::ExistNand,
-                _ if op == BDDOp::Nor as u8 => BDDOp::ExistNor,
-                _ if op == BDDOp::Xor as u8 => BDDOp::ExistXor,
-                _ if op == BDDOp::Equiv as u8 => BDDOp::ExistEquiv,
-                _ if op == BDDOp::Imp as u8 => BDDOp::ExistImp,
-                _ if op == BDDOp::ImpStrict as u8 => BDDOp::ExistImpStrict,
+                _ if op == BDDOp::And as u8 => BDDOp::ExistsAnd,
+                _ if op == BDDOp::Or as u8 => BDDOp::ExistsOr,
+                _ if op == BDDOp::Nand as u8 => BDDOp::ExistsNand,
+                _ if op == BDDOp::Nor as u8 => BDDOp::ExistsNor,
+                _ if op == BDDOp::Xor as u8 => BDDOp::ExistsXor,
+                _ if op == BDDOp::Equiv as u8 => BDDOp::ExistsEquiv,
+                _ if op == BDDOp::Imp as u8 => BDDOp::ExistsImp,
+                _ if op == BDDOp::ImpStrict as u8 => BDDOp::ExistsImpStrict,
                 _ => panic!("invalid OP"),
             }
         } else if q == BDDOp::Xor as u8 {
@@ -374,33 +374,6 @@ static STAT_COUNTERS: [crate::StatCounters; <BDDOp as oxidd_core::Countable>::MA
 pub fn print_stats() {
     eprintln!("[oxidd_rules_bdd::simple]");
     crate::StatCounters::print::<BDDOp>(&STAT_COUNTERS);
-}
-
-// --- Utility Functions -------------------------------------------------------
-
-#[inline]
-fn is_var<M>(manager: &M, node: &M::InnerNode) -> bool
-where
-    M: Manager<Terminal = BDDTerminal>,
-{
-    let t = node.child(0);
-    let e = node.child(1);
-    manager.get_node(&t).is_terminal(&BDDTerminal::True)
-        && manager.get_node(&e).is_terminal(&BDDTerminal::False)
-}
-
-#[inline]
-#[track_caller]
-fn var_level<M>(manager: &M, e: Borrowed<M::Edge>) -> LevelNo
-where
-    M: Manager<Terminal = BDDTerminal>,
-    M::InnerNode: HasLevel,
-{
-    let node = manager
-        .get_node(&e)
-        .expect_inner("Expected a variable but got a terminal node");
-    debug_assert!(is_var(manager, node));
-    node.level()
 }
 
 // --- Function Interface ------------------------------------------------------

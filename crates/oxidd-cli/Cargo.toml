@@ -1,20 +1,20 @@
 [package]
 name = "oxidd-cli"
-version = "0.2.2"
+version = "0.4.1"
 edition = "2021"
 description = "Command line interface for OxiDD"
 readme = "../../README.md"
 keywords = ["decision-diagrams", "bdd", "zbdd", "zdd"]
 categories = ["command-line-utilities", "mathematics", "science"]
 
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 
 [dependencies]
-oxidd = { workspace = true, features = ["bdd", "bcdd"] }
+oxidd = { workspace = true, features = ["bdd", "bcdd", "zbdd", "dddmp", "dot-export"] }
 oxidd-core.workspace = true
 oxidd-dump.workspace = true
 oxidd-reorder.workspace = true
@@ -26,16 +26,20 @@ clap = { version = "4", features = ["derive", "wrap_help"] }
 # big integers
 num-bigint = "0.4"
 
+# fast hash function
+#
+# Note that there is a performance regression with 2.0, see
+# https://github.com/rust-lang/rustc-hash/issues/45
+rustc-hash = "1.1"
+
 parking_lot = "0.12" # fast alternative Mutex & RwLock implementation
-rustc-hash = "2"     # fast hash function
 rayon = "1.10"       # thread pools, parallel iterators etc.
-bitvec = "1"
 
 # statistics output
 csv = "1.3.0"
 serde = { version = "1.0.204", features = ["derive"] }
 
-sysinfo = "0.30" # get available memory
+sysinfo = "0.36.0" # get available memory
 
 
 [features]

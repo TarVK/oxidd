@@ -20,24 +20,26 @@ use std::hash::{Hash, Hasher};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::AtomicU32;
+use std::ops::Range;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Acquire, Relaxed};
 use std::sync::Arc;
 
-use bitvec::vec::BitVec;
 use crossbeam_utils::CachePadded;
+use derive_where::derive_where;
+use fixedbitset::FixedBitSet;
 use linear_hashtbl::raw::RawTable;
-use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
-use rayon::ThreadPool;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use rustc_hash::FxHasher;
 
+use oxidd_core::error::{DuplicateVarName, OutOfMemory};
 use oxidd_core::function::EdgeOfFunc;
-use oxidd_core::util::{AbortOnDrop, AllocResult, Borrowed, DropWith, GCContainer, OutOfMemory};
-use oxidd_core::{DiagramRules, InnerNode, LevelNo, Tag};
+use oxidd_core::util::{AbortOnDrop, AllocResult, Borrowed, DropWith, OnDrop, VarNameMap};
+use oxidd_core::{DiagramRules, InnerNode, LevelNo, ManagerEventSubscriber, Tag, VarNo};
 
 use crate::node::NodeBase;
 use crate::terminal_manager::TerminalManager;
-use crate::util::{Invariant, TryLock};
+use crate::util::{rwlock::RwLock, Invariant, TryLock, VarLevelMap};
 
 // === Type Constructors =======================================================
 
@@ -86,7 +88,9 @@ pub trait ManagerDataCons<
     type T<'id>: Send
         + Sync
         + DropWith<Edge<'id, NC::T<'id>, ET>>
-        + GCContainer<Manager<'id, NC::T<'id>, ET, TMC::T<'id>, RC::T<'id>, Self::T<'id>, TERMINALS>>;
+        + ManagerEventSubscriber<
+            Manager<'id, NC::T<'id>, ET, TMC::T<'id>, RC::T<'id>, Self::T<'id>, TERMINALS>,
+        >;
 }
 
 // === Manager & Edges =========================================================
@@ -110,6 +114,7 @@ where
     terminal_manager: TM,
     state: CachePadded<Mutex<SharedStoreState>>,
     gc_signal: (Mutex<GCSignal>, Condvar),
+    workers: crate::workers::Workers,
 }
 
 unsafe impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> Sync
@@ -186,7 +191,7 @@ struct LocalStoreState {
     /// require `TERMINALS >= 1`), there is no ambiguity.
     next_free: Cell<u32>,
 
-    /// All slots in range `..initialized` are not `uninit`, i.e. either a
+    /// All slots in range `..initialized` are not `uninit`, i.e., either a
     /// `node` or a `next_free` ID. All slots until the next multiple of
     /// `CHUNK_SIZE` can be used by the local thread. So if
     /// `initialized % CHUNK_SIZE == 0` the worker needs to allocate a new chunk
@@ -230,8 +235,12 @@ where
     TM: TerminalManager<'id, N, ET, TERMINALS>,
     MD: DropWith<Edge<'id, N, ET>>;
 
+/// Node slot. We distinguish three states, corresponding to the variants:
+/// "containing a node," "free," and "uninitialized."
 union Slot<N> {
     node: ManuallyDrop<N>,
+    /// ID of the next free slot or `0` if there is none. Subtract `TERMINALS`
+    /// to get the `SlotSlice` index.
     next_free: u32,
     #[allow(unused)]
     uninit: (),
@@ -248,10 +257,11 @@ struct SlotSlice<'id, N, const TERMINALS: usize> {
 /// Internally, this is represented as a `u32` index.
 #[repr(transparent)]
 #[must_use]
+#[derive_where(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Edge<'id, N, ET>(
     /// `node_index | edge_tag << (u32::BITS - Self::TAG_BITS)`
     u32,
-    PhantomData<(Invariant<'id>, N, ET)>,
+    #[derive_where(skip)] PhantomData<(Invariant<'id>, N, ET)>,
 );
 
 #[repr(C)]
@@ -263,16 +273,18 @@ where
     MD: DropWith<Edge<'id, N, ET>>,
 {
     unique_table: Vec<Mutex<LevelViewSet<'id, N, ET, TM, R, MD, TERMINALS>>>,
+    var_level_map: VarLevelMap,
+    var_name_map: VarNameMap,
     data: ManuallyDrop<MD>,
     /// Pointer back to the store, obtained via [`Arc::as_ptr()`].
     ///
     /// Theoretically, we should be able to get the pointer from a `&Manager`
     /// reference, but this leads to provenance issues.
     store: *const Store<'id, N, ET, TM, R, MD, TERMINALS>,
+    gc_count: AtomicU64,
     reorder_count: u64,
     gc_ongoing: TryLock,
-    workers: ThreadPool,
-    split_depth: AtomicU32,
+    reorder_gc_prepared: bool,
 }
 
 /// Type "constructor" for the manager from `InnerNodeCons` etc.
@@ -311,7 +323,7 @@ unsafe impl<
 
 // --- Edge Impls --------------------------------------------------------------
 
-impl<'id, N: NodeBase, ET: Tag> Edge<'id, N, ET> {
+impl<N: NodeBase, ET: Tag> Edge<'_, N, ET> {
     const TAG_BITS: u32 = {
         let bits = usize::BITS - ET::MAX_VALUE.leading_zeros();
         assert!(bits <= 16, "Maximum value of edge tag is too large");
@@ -330,7 +342,7 @@ impl<'id, N: NodeBase, ET: Tag> Edge<'id, N, ET> {
         self.0
     }
 
-    /// Get the node ID, i.e. the edge value without any tags
+    /// Get the node ID, i.e., the edge value without any tags
     #[inline(always)]
     fn node_id(&self) -> usize {
         (self.0 & !Self::TAG_MASK) as usize
@@ -352,7 +364,7 @@ impl<'id, N: NodeBase, ET: Tag> Edge<'id, N, ET> {
     ///
     /// # Safety
     ///
-    /// `id` must be a terminal ID, i.e. `id < TERMINALS`, and the caller must
+    /// `id` must be a terminal ID, i.e., `id < TERMINALS`, and the caller must
     /// update the reference count for the terminal accordingly.
     #[inline(always)]
     pub unsafe fn from_terminal_id(id: u32) -> Self {
@@ -360,46 +372,16 @@ impl<'id, N: NodeBase, ET: Tag> Edge<'id, N, ET> {
     }
 }
 
-impl<'id, N, ET> PartialEq for Edge<'id, N, ET> {
-    #[inline(always)]
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl<'id, N, ET> Eq for Edge<'id, N, ET> {}
-
-impl<'id, N, ET> PartialOrd for Edge<'id, N, ET> {
-    #[inline(always)]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.0.cmp(&other.0))
-    }
-}
-
-impl<'id, N, ET> Ord for Edge<'id, N, ET> {
-    #[inline(always)]
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl<'id, N, ET> Hash for Edge<'id, N, ET> {
-    #[inline(always)]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl<'id, N: NodeBase, ET: Tag> oxidd_core::Edge for Edge<'id, N, ET> {
+impl<N: NodeBase, ET: Tag> oxidd_core::Edge for Edge<'_, N, ET> {
     type Tag = ET;
 
     #[inline]
-    fn borrowed(&self) -> Borrowed<Self> {
+    fn borrowed(&self) -> Borrowed<'_, Self> {
         Borrowed::new(Self(self.0, PhantomData))
     }
 
     #[inline]
-    fn with_tag(&self, tag: Self::Tag) -> Borrowed<Self> {
+    fn with_tag(&self, tag: Self::Tag) -> Borrowed<'_, Self> {
         Borrowed::new(Self(
             (self.0 & !Self::TAG_MASK) | ((tag.as_usize() as u32) << Self::TAG_SHIFT),
             PhantomData,
@@ -423,7 +405,7 @@ impl<'id, N: NodeBase, ET: Tag> oxidd_core::Edge for Edge<'id, N, ET> {
     }
 }
 
-impl<'id, N, ET> Drop for Edge<'id, N, ET> {
+impl<N, ET> Drop for Edge<'_, N, ET> {
     #[inline(never)]
     #[cold]
     fn drop(&mut self) {
@@ -517,10 +499,6 @@ where
     MD: DropWith<Edge<'id, N, ET>>,
 {
     const CHECK_TERMINALS: () = {
-        assert!(
-            usize::BITS >= u32::BITS,
-            "This manager implementation assumes usize::BITS >= u32::BITS"
-        );
         assert!(TERMINALS >= 1, "TERMINALS must be >= 1");
         assert!(
             TERMINALS <= u32::MAX as usize,
@@ -530,7 +508,7 @@ where
 
     #[inline(always)]
     fn addr(&self) -> usize {
-        // TODO: Use the respective strict provenance method once stable
+        // TODO: Use `pointer::addr()` once we raise the MSRV to 1.84
         self as *const Self as usize
     }
 
@@ -589,7 +567,7 @@ where
                 1
             };
 
-            self.get_slot_from_shared(node_count_delta)
+            self.get_slot_from_shared(state, node_count_delta)
         });
         match res {
             Ok((id, slot)) => {
@@ -608,6 +586,7 @@ where
     /// SAFETY: `id` must be the ID of a free slot and the current thread must
     /// have exclusive access to it.
     #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
     unsafe fn use_free_slot(&self, id: u32) -> (u32, &mut Slot<N>) {
         debug_assert!(id as usize >= TERMINALS);
         let index = id as usize - TERMINALS;
@@ -624,61 +603,67 @@ where
     ///
     /// `delta` is added to the shared node count.
     ///
-    /// Returns the ID of a free slot.
+    /// Unless out of memory, this method returns the ID of a free or
+    /// uninitialized slot as well as a reference pointing to that slot.
     #[cold]
-    fn get_slot_from_shared(&self, delta: i32) -> AllocResult<(u32, &mut Slot<N>)> {
-        LOCAL_STORE_STATE.with(|local| {
-            let mut shared = self.state.lock();
+    #[allow(clippy::mut_from_ref)]
+    fn get_slot_from_shared(
+        &self,
+        local: &LocalStoreState,
+        delta: i32,
+    ) -> AllocResult<(u32, &mut Slot<N>)> {
+        let mut shared = self.state.lock();
 
-            shared.node_count += delta as i64;
-            if shared.gc_state == GCState::Init && shared.node_count >= shared.gc_hwm as i64 {
-                shared.gc_state = GCState::Triggered;
-                self.gc_signal.1.notify_one();
+        shared.node_count += delta as i64;
+        if shared.gc_state == GCState::Init && shared.node_count >= shared.gc_hwm as i64 {
+            shared.gc_state = GCState::Triggered;
+            self.gc_signal.1.notify_one();
+        }
+
+        if local.current_store.get() == self.addr() {
+            debug_assert_eq!(local.next_free.get(), 0);
+            debug_assert_eq!(local.initialized.get() % CHUNK_SIZE, 0);
+
+            if let Some(id) = shared.next_free.pop() {
+                // SAFETY: `id` is the ID of a free slot, we have exclusive access
+                let (next_free, slot) = unsafe { self.use_free_slot(id) };
+                local.next_free.set(next_free);
+                return Ok((id, slot));
             }
 
-            if local.current_store.get() == self.addr() {
-                debug_assert_eq!(local.next_free.get(), 0);
-                debug_assert_eq!(local.initialized.get() % CHUNK_SIZE, 0);
-
-                if let Some(id) = shared.next_free.pop() {
-                    // SAFETY: `id` is the ID of a free slot, we have exclusive access
-                    let (next_free, slot) = unsafe { self.use_free_slot(id) };
-                    local.next_free.set(next_free);
-                    return Ok((id, slot));
-                }
-
-                let index = shared.allocated;
-                let slots = &self.inner_nodes.slots;
-                if (index as usize + CHUNK_SIZE as usize) < slots.len() {
-                    shared.allocated = (index / CHUNK_SIZE + 1) * CHUNK_SIZE;
-                    local.initialized.set(index + 1);
-                } else if (index as usize) < slots.len() {
-                    shared.allocated += 1;
-                } else {
-                    return Err(OutOfMemory);
-                }
-                // SAFETY: `index` is in bounds, the slot is uninitialized
-                let slot = unsafe { &mut *slots.get_unchecked(index as usize).get() };
-                Ok((index + TERMINALS as u32, slot))
-            } else {
-                if let Some(id) = shared.next_free.pop() {
-                    // SAFETY: `id` is the ID of a free slot, we have exclusive access
-                    let (next_free, slot) = unsafe { self.use_free_slot(id) };
-                    shared.next_free.push(next_free);
-                    return Ok((id, slot));
-                }
-
-                let index = shared.allocated;
-                let slots = &self.inner_nodes.slots;
-                if (index as usize) >= slots.len() {
-                    return Err(OutOfMemory);
-                }
+            let index = shared.allocated;
+            let slots = &self.inner_nodes.slots;
+            if (index as usize + CHUNK_SIZE as usize) < slots.len() {
+                shared.allocated = (index / CHUNK_SIZE + 1) * CHUNK_SIZE;
+                local.initialized.set(index + 1);
+            } else if (index as usize) < slots.len() {
                 shared.allocated += 1;
-                // SAFETY: `index` is in bounds, the slot is uninitialized
-                let slot = unsafe { &mut *slots.get_unchecked(index as usize).get() };
-                Ok((index + TERMINALS as u32, slot))
+            } else {
+                return Err(OutOfMemory);
             }
-        })
+            // SAFETY: `index` is in bounds, the slot is uninitialized
+            let slot = unsafe { &mut *slots.get_unchecked(index as usize).get() };
+            Ok((index + TERMINALS as u32, slot))
+        } else {
+            if let Some(id) = shared.next_free.pop() {
+                // SAFETY: `id` is the ID of a free slot, we have exclusive access
+                let (next_free, slot) = unsafe { self.use_free_slot(id) };
+                if next_free != 0 {
+                    shared.next_free.push(next_free);
+                }
+                return Ok((id, slot));
+            }
+
+            let index = shared.allocated;
+            let slots = &self.inner_nodes.slots;
+            if (index as usize) >= slots.len() {
+                return Err(OutOfMemory);
+            }
+            shared.allocated += 1;
+            // SAFETY: `index` is in bounds, the slot is uninitialized
+            let slot = unsafe { &mut *slots.get_unchecked(index as usize).get() };
+            Ok((index + TERMINALS as u32, slot))
+        }
     }
 
     /// Drop an edge that originates from the unique table.
@@ -715,11 +700,12 @@ where
         unsafe { self.free_slot(&mut *slot_ptr, id) };
     }
 
-    /// Free `slot`, i.e. drop the node and add its ID (`id`) to the free list
+    /// Free `slot`, i.e., drop the node and add its ID (`id`) to the free list
     ///
     /// SAFETY: `slot` must contain a node. `id` is the ID of `slot`.
     #[inline]
     unsafe fn free_slot(&self, slot: &mut Slot<N>, id: u32) {
+        debug_assert!(id as usize >= TERMINALS);
         // SAFETY: We don't use the node in `slot` again.
         unsafe { ManuallyDrop::take(&mut slot.node) }.drop_with(|edge| self.drop_edge(edge));
 
@@ -769,7 +755,7 @@ where
             debug_assert!(_old_rc > 1);
         } else {
             std::mem::forget(edge);
-            // SAFETY: `id` is a valid terminal ID
+            // SAFETY: `id` is a valid terminal ID and `edge` is forgotten
             unsafe { self.terminal_manager.release(id) };
         }
     }
@@ -826,8 +812,8 @@ where
 
 // --- LocalStoreStateGuard impl -----------------------------------------------
 
-impl<'a, 'id, N, ET, TM, R, MD, const TERMINALS: usize> Drop
-    for LocalStoreStateGuard<'a, 'id, N, ET, TM, R, MD, TERMINALS>
+impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> Drop
+    for LocalStoreStateGuard<'_, 'id, N, ET, TM, R, MD, TERMINALS>
 where
     N: NodeBase + InnerNode<Edge<'id, N, ET>>,
     ET: Tag,
@@ -851,6 +837,8 @@ where
                     debug_assert!(start <= u32::MAX - CHUNK_SIZE);
                     let end = (start / CHUNK_SIZE + 1) * CHUNK_SIZE;
                     let last_slot = &slots[(end - 1) as usize];
+                    // SAFETY (next 2): We have exclusive access to the (uninitialized) slots in the
+                    // range from `local.initialized` up to the next multiple of `CHUNK_SIZE`.
                     unsafe { &mut *last_slot.get() }.next_free = local.next_free.get();
                     for (slot, next_id) in slots[start as usize..(end - 1) as usize]
                         .iter()
@@ -890,13 +878,40 @@ where
     N: NodeBase + InnerNode<Edge<'id, N, ET>>,
     ET: Tag,
     TM: TerminalManager<'id, N, ET, TERMINALS>,
-    MD: DropWith<Edge<'id, N, ET>>,
+    R: oxidd_core::DiagramRules<Edge<'id, N, ET>, N, TM::TerminalNode>,
+    MD: DropWith<Edge<'id, N, ET>> + ManagerEventSubscriber<Self>,
 {
-    // Get a reference to the store
+    /// Get a reference to the store
+    #[inline]
     fn store(&self) -> &Store<'id, N, ET, TM, R, MD, TERMINALS> {
+        // We can simply get the store pointer by subtracting the offset of
+        // `Manager` in `Store`. The only issue is that this violates Rust's
+        // (proposed) aliasing rules. Hence, we only provide a hint that the
+        // store's address can be computed without loading the value.
+        let offset = const {
+            std::mem::offset_of!(Store<'static, N, ET, TM, R, MD, TERMINALS>, manager)
+                + RwLock::<Self>::DATA_OFFSET
+        };
+        // SAFETY:
+        // - The pointer resulting from the subtraction is in bounds of the `Store`
+        //   allocation.
+        // - The pointers are equal after initialization of `self.store`.
+        unsafe {
+            std::hint::assert_unchecked(std::ptr::eq(
+                std::ptr::from_ref(self).cast::<u8>().sub(offset).cast(),
+                self.store,
+            ))
+        };
+
         // SAFETY: After initialization, `self.store` always points to the
         // containing `Store`.
         unsafe { &*self.store }
+    }
+
+    /// Initialize the manager data
+    fn init(&mut self) {
+        self.data.init(self);
+        MD::init_mut(self);
     }
 }
 
@@ -907,22 +922,34 @@ where
     ET: Tag,
     TM: TerminalManager<'id, N, ET, TERMINALS>,
     R: oxidd_core::DiagramRules<Edge<'id, N, ET>, N, TM::TerminalNode>,
-    MD: DropWith<Edge<'id, N, ET>> + GCContainer<Self>,
+    MD: DropWith<Edge<'id, N, ET>> + ManagerEventSubscriber<Self>,
 {
     type Edge = Edge<'id, N, ET>;
     type EdgeTag = ET;
     type InnerNode = N;
     type Terminal = TM::TerminalNode;
-    type TerminalRef<'a> = TM::TerminalNodeRef<'a> where Self: 'a;
+    type TerminalRef<'a>
+        = TM::TerminalNodeRef<'a>
+    where
+        Self: 'a;
     type Rules = R;
 
-    type TerminalIterator<'a> = TM::Iterator<'a> where Self: 'a;
+    type TerminalIterator<'a>
+        = TM::Iterator<'a>
+    where
+        Self: 'a;
     type NodeSet = NodeSet;
-    type LevelView<'a> = LevelView<'a, 'id, N, ET, TM, R, MD, TERMINALS> where Self: 'a;
-    type LevelIterator<'a> = LevelIter<'a, 'id, N, ET, TM, R, MD, TERMINALS> where Self: 'a;
+    type LevelView<'a>
+        = LevelView<'a, 'id, N, ET, TM, R, MD, TERMINALS>
+    where
+        Self: 'a;
+    type LevelIterator<'a>
+        = LevelIter<'a, 'id, N, ET, TM, R, MD, TERMINALS>
+    where
+        Self: 'a;
 
     #[inline]
-    fn get_node(&self, edge: &Self::Edge) -> oxidd_core::Node<Self> {
+    fn get_node(&self, edge: &Self::Edge) -> oxidd_core::Node<'_, Self> {
         let store = self.store();
         let id = edge.node_id();
         if id >= TERMINALS {
@@ -943,6 +970,68 @@ where
         self.store().drop_edge(edge)
     }
 
+    #[track_caller]
+    fn try_remove_node(&self, edge: Edge<'id, N, ET>, level: LevelNo) -> bool {
+        let id = edge.node_id();
+        let store = self.store();
+        if id < TERMINALS {
+            std::mem::forget(edge);
+            // SAFETY: `id` is a valid terminal ID and `edge` is forgotten
+            unsafe { store.terminal_manager.release(id) };
+            debug_assert_eq!(level, LevelNo::MAX, "`level` does not match");
+            return false;
+        }
+
+        // inner node
+        let node = store.inner_nodes.inner_node(&edge);
+        std::mem::forget(edge);
+        // SAFETY: `edge` is forgotten
+        let old_rc = unsafe { node.release() };
+
+        debug_assert_ne!(level, LevelNo::MAX, "`level` does not match");
+        debug_assert!(
+            (level as usize) < self.unique_table.len(),
+            "`level` out of range"
+        );
+        debug_assert!(node.check_level(|l| l == level), "`level` does not match");
+        debug_assert!(old_rc > 1);
+
+        if old_rc != 2 || !self.reorder_gc_prepared {
+            return false;
+        }
+
+        let Some(set) = self.unique_table.get(level as usize) else {
+            return false;
+        };
+        let mut set = set.lock();
+
+        // Read the reference count again: Another thread may have created an
+        // edge between our `node.release()` call and `set.lock()`.
+        let rc = node.load_rc(Acquire);
+        debug_assert_ne!(rc, 0);
+        if rc != 1 {
+            return false;
+        }
+
+        // SAFETY: we checked that `reorder_gc_prepared` is true above
+        let Some(edge) = (unsafe { set.remove(&store.inner_nodes, node) }) else {
+            return false;
+        };
+
+        // SAFETY (next 2): `edge` is untagged and points to an inner node
+        let slot_ptr = unsafe { store.inner_nodes.slot_pointer_unchecked(&edge) };
+        let id = unsafe { edge.node_id_unchecked() };
+        std::mem::forget(edge);
+
+        // SAFETY: Since `rc` is 1, this is the last reference. We use `Acquire`
+        // order above and `Release` order when decrementing reference counters,
+        // so we have exclusive node access now. The slot contains a node. `id`
+        // is the ID of the slot.
+        unsafe { store.free_slot(&mut *slot_ptr, id) };
+
+        true
+    }
+
     #[inline]
     fn num_inner_nodes(&self) -> usize {
         self.unique_table
@@ -961,27 +1050,147 @@ where
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn num_levels(&self) -> LevelNo {
         self.unique_table.len() as LevelNo
     }
 
-    #[inline]
-    fn add_level(&mut self, f: impl FnOnce(LevelNo) -> Self::InnerNode) -> AllocResult<Self::Edge> {
-        let store = self.store();
-        let no = self.unique_table.len() as LevelNo;
-        assert!(no != LevelNo::MAX, "Too many levels");
-        let [e1, e2] = store.add_node(f(no))?;
-        let mut set: LevelViewSet<'id, N, ET, TM, R, MD, TERMINALS> = Default::default();
-        set.insert(&store.inner_nodes, e1);
-        self.unique_table.push(Mutex::new(set));
-        Ok(e2)
+    #[inline(always)]
+    fn num_named_vars(&self) -> VarNo {
+        self.var_name_map.named_count() as VarNo
     }
 
-    #[inline]
+    #[track_caller]
+    fn add_vars(&mut self, additional: VarNo) -> Range<VarNo> {
+        let len = self.unique_table.len() as VarNo;
+        let new_len = len.checked_add(additional).expect("too many variables");
+        let range = len..new_len;
+
+        self.data.pre_reorder(self);
+        MD::pre_reorder_mut(self);
+
+        self.unique_table
+            .resize_with(new_len as usize, || Mutex::new(LevelViewSet::default()));
+        self.var_level_map.extend(additional);
+        self.var_name_map.add_unnamed(additional);
+
+        debug_assert_eq!(new_len as usize, self.unique_table.len());
+        debug_assert_eq!(new_len as usize, self.var_level_map.len());
+        debug_assert_eq!(new_len, self.var_name_map.len());
+
+        self.data.post_reorder(self);
+        MD::post_reorder_mut(self);
+
+        range
+    }
+
+    #[track_caller]
+    fn add_named_vars<S: Into<String>>(
+        &mut self,
+        names: impl IntoIterator<Item = S>,
+    ) -> Result<Range<VarNo>, DuplicateVarName> {
+        self.data.pre_reorder(self);
+        MD::pre_reorder_mut(self);
+
+        let len = self.var_name_map.len();
+        let mut on_drop = OnDrop::new(self, |this| {
+            // This block is executed whenever `on_drop` gets dropped, i.e.,
+            // even if iterating over `names` or converting a value of type `S`
+            // into a `String` panics. This way, we ensure that the manager's
+            // state remains consistent.
+            let new_len = this.var_name_map.len();
+            this.unique_table
+                .resize_with(new_len as usize, || Mutex::new(LevelViewSet::default()));
+            this.var_level_map.extend((new_len - len) as VarNo);
+
+            debug_assert_eq!(new_len as usize, this.unique_table.len());
+            debug_assert_eq!(new_len as usize, this.var_level_map.len());
+            debug_assert_eq!(new_len, this.var_name_map.len());
+
+            this.data.post_reorder(this);
+            MD::post_reorder_mut(this);
+        });
+
+        let mut names = names.into_iter();
+        let range = on_drop.data_mut().var_name_map.add_named(names.by_ref())?;
+        drop(on_drop);
+
+        if names.next().is_some() {
+            // important: panic only after dropping `on_drop`
+            panic!("too many variables");
+        }
+
+        Ok(range)
+    }
+
+    #[track_caller]
+    fn add_named_vars_from_map(
+        &mut self,
+        map: VarNameMap,
+    ) -> Result<Range<VarNo>, DuplicateVarName> {
+        if !self.var_name_map.is_empty() {
+            return self.add_named_vars(map.into_names_iter());
+        }
+
+        self.data.pre_reorder(self);
+        MD::pre_reorder_mut(self);
+
+        let n = map.len();
+        self.unique_table
+            .resize_with(n as usize, || Mutex::new(LevelViewSet::default()));
+        self.var_level_map.extend(n);
+        self.var_name_map = map;
+
+        debug_assert_eq!(n as usize, self.unique_table.len());
+        debug_assert_eq!(n as usize, self.var_level_map.len());
+        debug_assert_eq!(n, self.var_name_map.len());
+
+        self.data.post_reorder(self);
+        MD::post_reorder_mut(self);
+
+        Ok(0..n)
+    }
+
+    #[track_caller]
+    #[inline(always)]
+    fn var_name(&self, var: VarNo) -> &str {
+        self.var_name_map.var_name(var)
+    }
+
+    #[track_caller]
+    #[inline(always)]
+    fn set_var_name(
+        &mut self,
+        var: VarNo,
+        name: impl Into<String>,
+    ) -> Result<(), DuplicateVarName> {
+        self.var_name_map.set_var_name(var, name)
+    }
+
+    #[inline(always)]
+    fn name_to_var(&self, name: impl AsRef<str>) -> Option<VarNo> {
+        self.var_name_map.name_to_var(name)
+    }
+
+    #[track_caller]
+    #[inline(always)]
+    fn var_to_level(&self, var: VarNo) -> LevelNo {
+        self.var_level_map.var_to_level(var)
+    }
+
+    #[track_caller]
+    #[inline(always)]
+    fn level_to_var(&self, level: LevelNo) -> VarNo {
+        self.var_level_map.level_to_var(level)
+    }
+
+    #[track_caller]
+    #[inline(always)]
     fn level(&self, no: LevelNo) -> Self::LevelView<'_> {
         LevelView {
             store: self.store(),
+            var_level_map: &self.var_level_map,
+            allow_node_removal: self.reorder_gc_prepared,
             level: no,
             set: self.unique_table[no as usize].lock(),
         }
@@ -991,6 +1200,8 @@ where
     fn levels(&self) -> Self::LevelIterator<'_> {
         LevelIter {
             store: self.store(),
+            var_level_map: &self.var_level_map,
+            allow_node_removal: self.reorder_gc_prepared,
             level_front: 0,
             level_back: self.unique_table.len() as LevelNo,
             it: self.unique_table.iter(),
@@ -1017,6 +1228,7 @@ where
             // We don't want two concurrent garbage collections
             return 0;
         }
+        self.gc_count.fetch_add(1, Relaxed);
         let guard = AbortOnDrop("Garbage collection panicked.");
 
         #[cfg(feature = "statistics")]
@@ -1028,7 +1240,9 @@ where
                 .as_secs()
         );
 
-        self.data.pre_gc(self);
+        if !self.reorder_gc_prepared {
+            self.data.pre_gc(self);
+        }
 
         let store = self.store();
         let mut collected = 0;
@@ -1042,8 +1256,10 @@ where
         }
         collected += store.terminal_manager.gc();
 
-        // SAFETY: We called `pre_gc`, the garbage collection is done.
-        unsafe { self.data.post_gc(self) };
+        if !self.reorder_gc_prepared {
+            // SAFETY: We called `pre_gc`, the garbage collection is done.
+            unsafe { self.data.post_gc(self) };
+        }
         self.gc_ongoing.unlock();
         guard.defuse();
 
@@ -1060,14 +1276,39 @@ where
     }
 
     fn reorder<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        if self.reorder_gc_prepared {
+            // Reordering was already prepared (nested `reorder` call).
+            // Important: We must return here to not finalize the reordering
+            // before the parent `reorder` closure returns.
+            return f(self);
+        }
         let guard = AbortOnDrop("Reordering panicked.");
+
         self.data.pre_gc(self);
+        self.reorder_gc_prepared = true;
+        self.data.pre_reorder(self);
+        MD::pre_reorder_mut(self);
+
         let res = f(self);
+
+        self.data.post_reorder(self);
+        MD::post_reorder_mut(self);
+        self.reorder_gc_prepared = false;
         // SAFETY: We called `pre_gc`, the reordering is done.
         unsafe { self.data.post_gc(self) };
+
         guard.defuse();
+        // Depending on the reordering implementation, garbage collections are
+        // preformed, but not necessarily through `Self::gc`. So we increment
+        // the GC count here.
+        *self.gc_count.get_mut() += 1;
         self.reorder_count += 1;
         res
+    }
+
+    #[inline]
+    fn gc_count(&self) -> u64 {
+        self.gc_count.load(Relaxed)
     }
 
     #[inline]
@@ -1076,67 +1317,20 @@ where
     }
 }
 
-fn auto_split_depth(workers: &rayon::ThreadPool) -> u32 {
-    let threads = workers.current_num_threads();
-    if threads > 1 {
-        (4096 * threads).ilog2()
-    } else {
-        0
-    }
-}
-
-impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> oxidd_core::WorkerManager
+impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> oxidd_core::HasWorkers
     for Manager<'id, N, ET, TM, R, MD, TERMINALS>
 where
     N: NodeBase + InnerNode<Edge<'id, N, ET>> + Send + Sync,
     ET: Tag + Send + Sync,
     TM: TerminalManager<'id, N, ET, TERMINALS> + Send + Sync,
     R: oxidd_core::DiagramRules<Edge<'id, N, ET>, N, TM::TerminalNode>,
-    MD: DropWith<Edge<'id, N, ET>> + GCContainer<Self> + Send + Sync,
+    MD: DropWith<Edge<'id, N, ET>> + ManagerEventSubscriber<Self> + Send + Sync,
 {
-    #[inline]
-    fn current_num_threads(&self) -> usize {
-        self.workers.current_num_threads()
-    }
-
-    #[inline(always)]
-    fn split_depth(&self) -> u32 {
-        self.split_depth.load(Relaxed)
-    }
-
-    fn set_split_depth(&self, depth: Option<u32>) {
-        let depth = match depth {
-            Some(d) => d,
-            None => auto_split_depth(&self.workers),
-        };
-        self.split_depth.store(depth, Relaxed);
-    }
+    type WorkerPool = crate::workers::Workers;
 
     #[inline]
-    fn install<RA: Send>(&self, op: impl FnOnce() -> RA + Send) -> RA {
-        self.workers.install(op)
-    }
-
-    #[inline]
-    fn join<RA: Send, RB: Send>(
-        &self,
-        op_a: impl FnOnce() -> RA + Send,
-        op_b: impl FnOnce() -> RB + Send,
-    ) -> (RA, RB) {
-        self.workers.join(op_a, op_b)
-    }
-
-    #[inline]
-    fn broadcast<RA: Send>(
-        &self,
-        op: impl Fn(oxidd_core::BroadcastContext) -> RA + Sync,
-    ) -> Vec<RA> {
-        self.workers.broadcast(|ctx| {
-            op(oxidd_core::BroadcastContext {
-                index: ctx.index() as u32,
-                num_threads: ctx.num_threads() as u32,
-            })
-        })
+    fn workers(&self) -> &Self::WorkerPool {
+        &self.store().workers
     }
 }
 
@@ -1283,10 +1477,10 @@ where
         }
     }
 
-    /// Perform garbage collection, i.e. remove all nodes without references
+    /// Perform garbage collection, i.e., remove all nodes without references
     /// besides the internal edge
     ///
-    /// SAFETY: There must not be any "weak" edges, i.e. edges where the
+    /// SAFETY: There must not be any "weak" edges, i.e., edges where the
     /// reference count is not materialized (apply cache implementations exploit
     /// this).
     unsafe fn gc(&mut self, store: &Store<'id, N, ET, TM, R, MD, TERMINALS>) {
@@ -1305,8 +1499,8 @@ where
 
                 // SAFETY: Since `rc` is 1, this is the last reference. We use
                 // `Acquire` order above and `Release` order when decrementing
-                // reference counters, so we have exclusive node access now. It
-                // contains a node. `id` is the ID of the slot.
+                // reference counters, so we have exclusive node access now. The
+                // slot contains a node. `id` is the ID of the slot.
                 unsafe { store.free_slot(&mut *slot_ptr, id) };
             },
         );
@@ -1316,7 +1510,7 @@ where
     ///
     /// Returns `Some(edge)` if `node` was present, `None` otherwise
     ///
-    /// SAFETY: There must not be any "weak" edges, i.e. edges where the
+    /// SAFETY: There must not be any "weak" edges, i.e., edges where the
     /// reference count is not materialized (apply cache implementations exploit
     /// this).
     #[inline]
@@ -1339,13 +1533,13 @@ where
 
     /// Iterator that consumes all [`Edge`]s in the set
     #[inline]
-    fn drain(&mut self) -> linear_hashtbl::raw::Drain<Edge<'id, N, ET>, u32> {
+    fn drain(&mut self) -> linear_hashtbl::raw::Drain<'_, Edge<'id, N, ET>, u32> {
         self.0.drain()
     }
 }
 
-impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> Drop
-    for LevelViewSet<'id, N, ET, TM, R, MD, TERMINALS>
+impl<N, ET, TM, R, MD, const TERMINALS: usize> Drop
+    for LevelViewSet<'_, N, ET, TM, R, MD, TERMINALS>
 {
     #[inline]
     fn drop(&mut self) {
@@ -1355,8 +1549,8 @@ impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> Drop
     }
 }
 
-impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> Default
-    for LevelViewSet<'id, N, ET, TM, R, MD, TERMINALS>
+impl<N, ET, TM, R, MD, const TERMINALS: usize> Default
+    for LevelViewSet<'_, N, ET, TM, R, MD, TERMINALS>
 {
     #[inline]
     fn default() -> Self {
@@ -1395,7 +1589,7 @@ impl<'a, 'id, N, ET> Iterator for LevelViewIter<'a, 'id, N, ET> {
     }
 }
 
-impl<'a, 'id, N, ET> ExactSizeIterator for LevelViewIter<'a, 'id, N, ET> {
+impl<N, ET> ExactSizeIterator for LevelViewIter<'_, '_, N, ET> {
     #[inline(always)]
     fn len(&self) -> usize {
         self.0.len()
@@ -1414,6 +1608,10 @@ where
     MD: DropWith<Edge<'id, N, ET>>,
 {
     store: &'a Store<'id, N, ET, TM, R, MD, TERMINALS>,
+    var_level_map: &'a VarLevelMap,
+    /// SAFETY invariant: If set to true, a garbage collection is prepared
+    /// (i.e., there are no "weak" edges).
+    allow_node_removal: bool,
     level: LevelNo,
     set: MutexGuard<'a, LevelViewSet<'id, N, ET, TM, R, MD, TERMINALS>>,
 }
@@ -1426,7 +1624,8 @@ where
     TM: TerminalManager<'id, N, ET, TERMINALS>,
     MD: DropWith<Edge<'id, N, ET>>,
 {
-    type Iterator<'b> = LevelViewIter<'b, 'id, N, ET>
+    type Iterator<'b>
+        = LevelViewIter<'b, 'id, N, ET>
     where
         Self: 'b,
         Edge<'id, N, ET>: 'b;
@@ -1459,19 +1658,13 @@ where
         // No need to check if the node referenced by `edge` is stored in
         // `self.store` due to lifetime restrictions.
         let nodes = &self.store.inner_nodes;
-        nodes.inner_node(&edge).check_level(|level| {
-            assert_eq!(level, self.level, "node level does not match");
-            true
-        });
+        nodes.inner_node(&edge).assert_level_matches(self.level);
         self.set.insert(nodes, edge)
     }
 
     #[inline(always)]
     fn get_or_insert(&mut self, node: N) -> AllocResult<Edge<'id, N, ET>> {
-        node.check_level(|level| {
-            assert_eq!(level, self.level, "node level does not match");
-            true
-        });
+        node.assert_level_matches(self.level);
         // No need to check if the children of `node` are stored in `self.store`
         // due to lifetime restrictions.
         self.set.get_or_insert(
@@ -1483,16 +1676,19 @@ where
     }
 
     #[inline]
-    unsafe fn gc(&mut self) {
-        // SAFETY: Called from inside the closure of `Manager::reorder()`, hence
-        // there are no "weak" edges.
-        unsafe { self.set.gc(self.store) };
+    fn gc(&mut self) {
+        if self.allow_node_removal {
+            // SAFETY: By invariant, node removal is allowed.
+            unsafe { self.set.gc(self.store) };
+        }
     }
 
     #[inline]
-    unsafe fn remove(&mut self, node: &N) -> bool {
-        // SAFETY: Called from inside the closure of `Manager::reorder()`, hence
-        // there are no "weak" edges.
+    fn remove(&mut self, node: &N) -> bool {
+        if !self.allow_node_removal {
+            return false;
+        }
+        // SAFETY: By invariant, node removal is allowed.
         match unsafe { self.set.remove(&self.store.inner_nodes, node) } {
             Some(edge) => {
                 // SAFETY: `edge` is untagged and points to an inner node
@@ -1503,9 +1699,10 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     unsafe fn swap(&mut self, other: &mut Self) {
-        std::mem::swap(&mut self.set, &mut other.set);
+        self.var_level_map.swap_levels(self.level, other.level);
+        std::mem::swap(&mut *self.set, &mut *other.set);
     }
 
     #[inline]
@@ -1517,6 +1714,8 @@ where
     fn take(&mut self) -> Self::Taken {
         TakenLevelView {
             store: self.store,
+            var_level_map: self.var_level_map,
+            allow_node_removal: self.allow_node_removal,
             level: self.level,
             set: std::mem::take(&mut self.set),
         }
@@ -1531,20 +1730,29 @@ where
     MD: DropWith<Edge<'id, N, ET>>,
 {
     store: &'a Store<'id, N, ET, TM, R, MD, TERMINALS>,
+    var_level_map: &'a VarLevelMap,
+    /// SAFETY invariant: If set to true, a garbage collection is prepared
+    /// (i.e., there are no "weak" edges).
+    ///
+    /// Note that due to lifetime restrictions there is no way to have a
+    /// `TakenLevelView { allow_node_removal: true, .. }` when the associated
+    /// `Manager` has `reorder_gc_prepared` set to `false`.
+    allow_node_removal: bool,
     level: LevelNo,
     set: LevelViewSet<'id, N, ET, TM, R, MD, TERMINALS>,
 }
 
-unsafe impl<'a, 'id, N, ET, TM, R, MD, const TERMINALS: usize>
+unsafe impl<'id, N, ET, TM, R, MD, const TERMINALS: usize>
     oxidd_core::LevelView<Edge<'id, N, ET>, N>
-    for TakenLevelView<'a, 'id, N, ET, TM, R, MD, TERMINALS>
+    for TakenLevelView<'_, 'id, N, ET, TM, R, MD, TERMINALS>
 where
     N: NodeBase + InnerNode<Edge<'id, N, ET>>,
     ET: Tag,
     TM: TerminalManager<'id, N, ET, TERMINALS>,
     MD: DropWith<Edge<'id, N, ET>>,
 {
-    type Iterator<'b> = LevelViewIter<'b, 'id, N, ET>
+    type Iterator<'b>
+        = LevelViewIter<'b, 'id, N, ET>
     where
         Self: 'b,
         Edge<'id, N, ET>: 'b;
@@ -1577,19 +1785,13 @@ where
         // No need to check if the node referenced by `edge` is stored in
         // `self.store` due to lifetime restrictions.
         let nodes = &self.store.inner_nodes;
-        nodes.inner_node(&edge).check_level(|level| {
-            assert_eq!(level, self.level, "node level does not match");
-            true
-        });
+        nodes.inner_node(&edge).assert_level_matches(self.level);
         self.set.insert(nodes, edge)
     }
 
     #[inline(always)]
     fn get_or_insert(&mut self, node: N) -> AllocResult<Edge<'id, N, ET>> {
-        node.check_level(|level| {
-            assert_eq!(level, self.level, "node level does not match");
-            true
-        });
+        node.assert_level_matches(self.level);
         // No need to check if the children of `node` are stored in `self.store`
         // due to lifetime restrictions.
         self.set.get_or_insert(
@@ -1601,16 +1803,19 @@ where
     }
 
     #[inline]
-    unsafe fn gc(&mut self) {
-        // SAFETY: Called from inside the closure of `Manager::reorder()`, hence
-        // there are no "weak" edges.
-        unsafe { self.set.gc(self.store) };
+    fn gc(&mut self) {
+        if self.allow_node_removal {
+            // SAFETY: By invariant, node removal is allowed.
+            unsafe { self.set.gc(self.store) };
+        }
     }
 
     #[inline]
-    unsafe fn remove(&mut self, node: &N) -> bool {
-        // SAFETY: Called from inside the closure of `Manager::reorder()`, hence
-        // there are no "weak" edges.
+    fn remove(&mut self, node: &N) -> bool {
+        if !self.allow_node_removal {
+            return false;
+        }
+        // SAFETY: By invariant, node removal is allowed.
         match unsafe { self.set.remove(&self.store.inner_nodes, node) } {
             Some(edge) => {
                 // SAFETY: `edge` is untagged and points to an inner node
@@ -1623,6 +1828,7 @@ where
 
     #[inline(always)]
     unsafe fn swap(&mut self, other: &mut Self) {
+        self.var_level_map.swap_levels(self.level, other.level);
         std::mem::swap(&mut self.set, &mut other.set);
     }
 
@@ -1635,14 +1841,16 @@ where
     fn take(&mut self) -> Self::Taken {
         Self {
             store: self.store,
+            var_level_map: self.var_level_map,
+            allow_node_removal: self.allow_node_removal,
             level: self.level,
             set: std::mem::take(&mut self.set),
         }
     }
 }
 
-impl<'a, 'id, N, ET, TM, R, MD, const TERMINALS: usize> Drop
-    for TakenLevelView<'a, 'id, N, ET, TM, R, MD, TERMINALS>
+impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> Drop
+    for TakenLevelView<'_, 'id, N, ET, TM, R, MD, TERMINALS>
 where
     N: NodeBase + InnerNode<Edge<'id, N, ET>>,
     ET: Tag,
@@ -1668,6 +1876,10 @@ where
     MD: DropWith<Edge<'id, N, ET>>,
 {
     store: &'a Store<'id, N, ET, TM, R, MD, TERMINALS>,
+    var_level_map: &'a VarLevelMap,
+    /// SAFETY invariant: If set to true, a garbage collection is prepared
+    /// (i.e., there are no "weak" edges).
+    allow_node_removal: bool,
     level_front: LevelNo,
     level_back: LevelNo,
     it: std::slice::Iter<'a, Mutex<LevelViewSet<'id, N, ET, TM, R, MD, TERMINALS>>>,
@@ -1685,18 +1897,16 @@ where
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        match self.it.next() {
-            Some(mutex) => {
-                let level = self.level_front;
-                self.level_front += 1;
-                Some(LevelView {
-                    store: self.store,
-                    level,
-                    set: mutex.lock(),
-                })
-            }
-            None => None,
-        }
+        let mutex = self.it.next()?;
+        let level = self.level_front;
+        self.level_front += 1;
+        Some(LevelView {
+            store: self.store,
+            var_level_map: self.var_level_map,
+            allow_node_removal: self.allow_node_removal,
+            level,
+            set: mutex.lock(),
+        })
     }
 
     #[inline]
@@ -1705,8 +1915,8 @@ where
     }
 }
 
-impl<'a, 'id, N, ET, TM, R, MD, const TERMINALS: usize> ExactSizeIterator
-    for LevelIter<'a, 'id, N, ET, TM, R, MD, TERMINALS>
+impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> ExactSizeIterator
+    for LevelIter<'_, 'id, N, ET, TM, R, MD, TERMINALS>
 where
     N: NodeBase + InnerNode<Edge<'id, N, ET>>,
     ET: Tag,
@@ -1729,8 +1939,8 @@ where
 {
 }
 
-impl<'a, 'id, N, ET, TM, R, MD, const TERMINALS: usize> DoubleEndedIterator
-    for LevelIter<'a, 'id, N, ET, TM, R, MD, TERMINALS>
+impl<'id, N, ET, TM, R, MD, const TERMINALS: usize> DoubleEndedIterator
+    for LevelIter<'_, 'id, N, ET, TM, R, MD, TERMINALS>
 where
     N: NodeBase + InnerNode<Edge<'id, N, ET>>,
     ET: Tag,
@@ -1738,23 +1948,22 @@ where
     MD: DropWith<Edge<'id, N, ET>>,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        match self.it.next_back() {
-            Some(mutex) => {
-                self.level_back -= 1;
-                Some(LevelView {
-                    store: self.store,
-                    level: self.level_back,
-                    set: mutex.lock(),
-                })
-            }
-            None => None,
-        }
+        let mutex = self.it.next_back()?;
+        self.level_back -= 1;
+        Some(LevelView {
+            store: self.store,
+            var_level_map: self.var_level_map,
+            allow_node_removal: self.allow_node_removal,
+            level: self.level_back,
+            set: mutex.lock(),
+        })
     }
 }
 
 // === ManagerRef ==============================================================
 
 #[repr(transparent)]
+#[derive_where(Clone)]
 pub struct ManagerRef<
     NC: InnerNodeCons<ET>,
     ET: Tag,
@@ -1805,7 +2014,7 @@ impl<
         const TERMINALS: usize,
     > ManagerRef<NC, ET, TMC, RC, MDC, TERMINALS>
 {
-    /// Convert `self` into a raw pointer, e.g. for usage in a foreign function
+    /// Convert `self` into a raw pointer, e.g., for usage in a foreign function
     /// interface.
     ///
     /// This method does not change any reference counters. To avoid a memory
@@ -1815,7 +2024,7 @@ impl<
     pub fn into_raw(self) -> *const std::ffi::c_void {
         let this = ManuallyDrop::new(self);
         // SAFETY: we move out of `this`
-        Arc::into_raw(unsafe { std::ptr::read(&this.0) }) as _
+        Arc::into_raw(unsafe { std::ptr::read(&this.0) }).cast()
     }
 
     /// Convert `raw` into a `ManagerRef`
@@ -1829,22 +2038,7 @@ impl<
     #[inline(always)]
     pub unsafe fn from_raw(raw: *const std::ffi::c_void) -> Self {
         // SAFETY: Invariants are upheld by the caller.
-        Self(unsafe { Arc::from_raw(raw as _) })
-    }
-}
-
-impl<
-        NC: InnerNodeCons<ET>,
-        ET: Tag,
-        TMC: TerminalManagerCons<NC, ET, TERMINALS>,
-        RC: DiagramRulesCons<NC, ET, TMC, MDC, TERMINALS>,
-        MDC: ManagerDataCons<NC, ET, TMC, RC, TERMINALS>,
-        const TERMINALS: usize,
-    > Clone for ManagerRef<NC, ET, TMC, RC, MDC, TERMINALS>
-{
-    #[inline]
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(unsafe { Arc::from_raw(raw.cast()) })
     }
 }
 
@@ -1897,9 +2091,7 @@ impl<
 {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        let a = &*self.0 as *const Store<_, _, _, _, _, TERMINALS>;
-        let b = &*other.0 as *const _;
-        a.cmp(&b)
+        std::ptr::from_ref(&*self.0).cmp(&std::ptr::from_ref(&*other.0))
     }
 }
 impl<
@@ -1913,8 +2105,7 @@ impl<
 {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let ptr = &*self.0 as *const Store<_, _, _, _, _, TERMINALS>;
-        ptr.hash(state);
+        std::ptr::from_ref(&*self.0).hash(state);
     }
 }
 
@@ -1931,16 +2122,17 @@ impl<
     for ManagerRef<NC, ET, TMC, RC, MDC, TERMINALS>
 {
     fn from(manager: &'a M<'id, NC, ET, TMC, RC, MDC, TERMINALS>) -> Self {
-        let ptr = manager as *const _ as *const M<'static, NC, ET, TMC, RC, MDC, TERMINALS>;
+        let ptr: *const M<'static, NC, ET, TMC, RC, MDC, TERMINALS> =
+            std::ptr::from_ref(manager).cast();
         // SAFETY:
         // - We just changed "identifier" lifetimes.
         // - The pointer was obtained via `Arc::into_raw()`, and since we have a
         //   `&Manager` reference, the counter is at least 1.
-        unsafe {
+        ManagerRef(unsafe {
             let manager = &*ptr;
             Arc::increment_strong_count(manager.store);
-            ManagerRef(Arc::from_raw(manager.store))
-        }
+            Arc::from_raw(manager.store)
+        })
     }
 }
 
@@ -1960,7 +2152,7 @@ impl<
         F: for<'id> FnOnce(&Self::Manager<'id>) -> T,
     {
         let local_guard = self.0.prepare_local_state();
-        let res = f(&self.0.manager.read());
+        let res = f(&self.0.manager.shared());
         drop(local_guard);
         res
     }
@@ -1970,7 +2162,7 @@ impl<
         F: for<'id> FnOnce(&mut Self::Manager<'id>) -> T,
     {
         let local_guard = self.0.prepare_local_state();
-        let res = f(&mut self.0.manager.write());
+        let res = f(&mut self.0.manager.exclusive());
         drop(local_guard);
         res
     }
@@ -1990,8 +2182,8 @@ pub fn new_manager<
     threads: u32,
     data: MDC::T<'static>,
 ) -> ManagerRef<NC, ET, TMC, RC, MDC, TERMINALS> {
-    // Evaluate a few constants for assertions
-    let _ = Store::<
+    // Evaluate constant for assertions
+    let () = Store::<
         'static,
         NC::T<'static>,
         ET,
@@ -2012,13 +2204,6 @@ pub fn new_manager<
     };
     let inner_node_capacity = std::cmp::min(inner_node_capacity, max_inner_capacity);
 
-    let workers = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads as usize)
-        .thread_name(|i| format!("oxidd mi {i}")) // "mi" for "manager index"
-        .build()
-        .expect("could not build thread pool");
-    let split_depth = AtomicU32::new(auto_split_depth(&workers));
-
     let gc_lwm = inner_node_capacity / 100 * 90;
     let gc_hwm = inner_node_capacity / 100 * 95;
 
@@ -2038,26 +2223,29 @@ pub fn new_manager<
         })),
         manager: RwLock::new(Manager {
             unique_table: Vec::new(),
+            var_level_map: VarLevelMap::new(),
+            var_name_map: VarNameMap::new(),
             data: ManuallyDrop::new(data),
             store: std::ptr::null(),
+            gc_count: AtomicU64::new(0),
             reorder_count: 0,
             gc_ongoing: TryLock::new(),
-            workers,
-            split_depth,
+            reorder_gc_prepared: false,
         }),
         terminal_manager: TMC::T::<'static>::with_capacity(terminal_node_capacity),
         gc_signal: (Mutex::new(GCSignal::RunGc), Condvar::new()),
+        workers: crate::workers::Workers::new(threads),
     });
 
-    let mut manager = arc.manager.write();
+    let mut manager = arc.manager.exclusive();
     manager.store = Arc::as_ptr(&arc);
+    drop(manager);
 
     let store_addr = arc.addr();
-    manager.workers.spawn_broadcast(move |_| {
+    arc.workers.pool.spawn_broadcast(move |_| {
         // The workers are dedicated to this store.
         LOCAL_STORE_STATE.with(|state| state.current_store.set(store_addr))
     });
-    drop(manager);
 
     // spell-checker:ignore mref
     let gc_mref: ManagerRef<NC, ET, TMC, RC, MDC, TERMINALS> = ManagerRef(arc.clone());
@@ -2097,12 +2285,35 @@ pub fn new_manager<
         })
         .unwrap();
 
+    // initialize the manager data
+    let local_guard = arc.prepare_local_state();
+    arc.manager.exclusive().init();
+    drop(local_guard);
+
     ManagerRef(arc)
+}
+
+impl<
+        NC: InnerNodeCons<ET>,
+        ET: Tag + Send + Sync,
+        TMC: TerminalManagerCons<NC, ET, TERMINALS>,
+        RC: DiagramRulesCons<NC, ET, TMC, MDC, TERMINALS>,
+        MDC: ManagerDataCons<NC, ET, TMC, RC, TERMINALS>,
+        const TERMINALS: usize,
+    > oxidd_core::HasWorkers for ManagerRef<NC, ET, TMC, RC, MDC, TERMINALS>
+{
+    type WorkerPool = crate::workers::Workers;
+
+    #[inline]
+    fn workers(&self) -> &Self::WorkerPool {
+        &self.0.workers
+    }
 }
 
 // === Function ================================================================
 
 #[repr(C)]
+#[derive_where(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Function<
     NC: InnerNodeCons<ET>,
     ET: Tag,
@@ -2124,7 +2335,7 @@ impl<
         const TERMINALS: usize,
     > Function<NC, ET, TMC, RC, MDC, TERMINALS>
 {
-    /// Convert `self` into a raw pointer and edge value, e.g. for usage in a
+    /// Convert `self` into a raw pointer and edge value, e.g., for usage in a
     /// foreign function interface.
     ///
     /// This method does not change any reference counters. To avoid a memory
@@ -2193,76 +2404,6 @@ impl<
     }
 }
 
-impl<
-        NC: InnerNodeCons<ET>,
-        ET: Tag,
-        TMC: TerminalManagerCons<NC, ET, TERMINALS>,
-        RC: DiagramRulesCons<NC, ET, TMC, MDC, TERMINALS>,
-        MDC: ManagerDataCons<NC, ET, TMC, RC, TERMINALS>,
-        const TERMINALS: usize,
-    > PartialEq for Function<NC, ET, TMC, RC, MDC, TERMINALS>
-{
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.store == other.store && self.edge == other.edge
-    }
-}
-impl<
-        NC: InnerNodeCons<ET>,
-        ET: Tag,
-        TMC: TerminalManagerCons<NC, ET, TERMINALS>,
-        RC: DiagramRulesCons<NC, ET, TMC, MDC, TERMINALS>,
-        MDC: ManagerDataCons<NC, ET, TMC, RC, TERMINALS>,
-        const TERMINALS: usize,
-    > Eq for Function<NC, ET, TMC, RC, MDC, TERMINALS>
-{
-}
-impl<
-        NC: InnerNodeCons<ET>,
-        ET: Tag,
-        TMC: TerminalManagerCons<NC, ET, TERMINALS>,
-        RC: DiagramRulesCons<NC, ET, TMC, MDC, TERMINALS>,
-        MDC: ManagerDataCons<NC, ET, TMC, RC, TERMINALS>,
-        const TERMINALS: usize,
-    > PartialOrd for Function<NC, ET, TMC, RC, MDC, TERMINALS>
-{
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl<
-        NC: InnerNodeCons<ET>,
-        ET: Tag,
-        TMC: TerminalManagerCons<NC, ET, TERMINALS>,
-        RC: DiagramRulesCons<NC, ET, TMC, MDC, TERMINALS>,
-        MDC: ManagerDataCons<NC, ET, TMC, RC, TERMINALS>,
-        const TERMINALS: usize,
-    > Ord for Function<NC, ET, TMC, RC, MDC, TERMINALS>
-{
-    #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.store
-            .cmp(&other.store)
-            .then(self.edge.cmp(&other.edge))
-    }
-}
-impl<
-        NC: InnerNodeCons<ET>,
-        ET: Tag,
-        TMC: TerminalManagerCons<NC, ET, TERMINALS>,
-        RC: DiagramRulesCons<NC, ET, TMC, MDC, TERMINALS>,
-        MDC: ManagerDataCons<NC, ET, TMC, RC, TERMINALS>,
-        const TERMINALS: usize,
-    > Hash for Function<NC, ET, TMC, RC, MDC, TERMINALS>
-{
-    #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.store.hash(state);
-        self.edge.hash(state);
-    }
-}
-
 unsafe impl<
         NC: InnerNodeCons<ET>,
         ET: Tag,
@@ -2272,23 +2413,24 @@ unsafe impl<
         const TERMINALS: usize,
     > oxidd_core::function::Function for Function<NC, ET, TMC, RC, MDC, TERMINALS>
 {
+    const REPR_ID: &str = "<none>";
+
     type Manager<'id> = M<'id, NC, ET, TMC, RC, MDC, TERMINALS>;
 
     type ManagerRef = ManagerRef<NC, ET, TMC, RC, MDC, TERMINALS>;
 
     #[inline]
     fn from_edge<'id>(manager: &Self::Manager<'id>, edge: EdgeOfFunc<'id, Self>) -> Self {
-        #[allow(clippy::unnecessary_cast)] // this cast is necessary
-        let ptr = manager as *const Self::Manager<'id> as *const Self::Manager<'static>;
+        let ptr: *const Self::Manager<'static> = std::ptr::from_ref(manager).cast();
         // SAFETY:
         // - We just changed "identifier" lifetimes.
         // - The pointer was obtained via `Arc::into_raw()`, and since we have a
         //   `&Manager` reference, the counter is at least 1.
-        let store = unsafe {
+        let store = ManagerRef(unsafe {
             let manager = &*ptr;
             Arc::increment_strong_count(manager.store);
-            ManagerRef(Arc::from_raw(manager.store))
-        };
+            Arc::from_raw(manager.store)
+        });
         // Avoid transmuting `edge` for changing lifetimes
         let id = edge.0;
         std::mem::forget(edge);
@@ -2301,11 +2443,11 @@ unsafe impl<
     #[inline]
     fn as_edge<'id>(&self, manager: &Self::Manager<'id>) -> &EdgeOfFunc<'id, Self> {
         assert!(
-            crate::util::ptr_eq_untyped(self.store.0.manager.data_ptr(), manager),
+            std::ptr::eq(self.store.0.manager.data_ptr().cast(), manager),
             "This function does not belong to `manager`"
         );
 
-        let ptr = &*self.edge as *const EdgeOfFunc<'static, Self> as *const EdgeOfFunc<'id, Self>;
+        let ptr: *const EdgeOfFunc<'id, Self> = std::ptr::from_ref(&*self.edge).cast();
         // SAFETY: Just changing lifetimes; we checked that `self.edge` belongs
         // to `manager` above.
         unsafe { &*ptr }
@@ -2314,7 +2456,7 @@ unsafe impl<
     #[inline]
     fn into_edge<'id>(self, manager: &Self::Manager<'id>) -> EdgeOfFunc<'id, Self> {
         assert!(
-            crate::util::ptr_eq_untyped(self.store.0.manager.data_ptr(), manager),
+            std::ptr::eq(self.store.0.manager.data_ptr().cast(), manager),
             "This function does not belong to `manager`"
         );
         // We only want to drop the store ref (but `Function` implements `Drop`,
@@ -2336,7 +2478,7 @@ unsafe impl<
         F: for<'id> FnOnce(&Self::Manager<'id>, &EdgeOfFunc<'id, Self>) -> T,
     {
         let local_guard = self.store.0.prepare_local_state();
-        let res = f(&self.store.0.manager.read(), &self.edge);
+        let res = f(&self.store.0.manager.shared(), &self.edge);
         drop(local_guard);
         res
     }
@@ -2346,7 +2488,7 @@ unsafe impl<
         F: for<'id> FnOnce(&mut Self::Manager<'id>, &EdgeOfFunc<'id, Self>) -> T,
     {
         let local_guard = self.store.0.prepare_local_state();
-        let res = f(&mut self.store.0.manager.write(), &self.edge);
+        let res = f(&mut self.store.0.manager.exclusive(), &self.edge);
         drop(local_guard);
         res
     }
@@ -2354,23 +2496,15 @@ unsafe impl<
 
 // === NodeSet =================================================================
 
-/// Node set implementation using a [bit vector][BitVec]
+/// Node set implementation using a [bit set][FixedBitSet]
 ///
 /// Since nodes are stored in an array, we can use a single bit vector. This
 /// reduces space consumption dramatically and increases the performance.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct NodeSet {
     len: usize,
-    data: BitVec,
+    data: FixedBitSet,
 }
-
-impl PartialEq for NodeSet {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.len == other.len && self.data == other.data
-    }
-}
-impl Eq for NodeSet {}
 
 impl<'id, N: NodeBase, ET: Tag> oxidd_core::util::NodeSet<Edge<'id, N, ET>> for NodeSet {
     #[inline(always)]
@@ -2381,14 +2515,10 @@ impl<'id, N: NodeBase, ET: Tag> oxidd_core::util::NodeSet<Edge<'id, N, ET>> for 
     #[inline]
     fn insert(&mut self, edge: &Edge<'id, N, ET>) -> bool {
         let index = edge.node_id();
-        if index < self.data.len() {
-            if self.data[index] {
-                return false;
-            }
-        } else {
-            self.data.resize((index + 1).next_power_of_two(), false);
+        if index < self.data.len() && self.data.contains(index) {
+            return false;
         }
-        self.data.set(index, true);
+        self.data.grow_and_insert(index);
         self.len += 1;
         true
     }
@@ -2397,7 +2527,7 @@ impl<'id, N: NodeBase, ET: Tag> oxidd_core::util::NodeSet<Edge<'id, N, ET>> for 
     fn contains(&self, edge: &Edge<'id, N, ET>) -> bool {
         let index = edge.node_id();
         if index < self.data.len() {
-            self.data[index]
+            self.data.contains(index)
         } else {
             false
         }
@@ -2406,9 +2536,9 @@ impl<'id, N: NodeBase, ET: Tag> oxidd_core::util::NodeSet<Edge<'id, N, ET>> for 
     #[inline]
     fn remove(&mut self, edge: &Edge<'id, N, ET>) -> bool {
         let index = edge.node_id();
-        if index < self.data.len() && self.data[index] {
+        if index < self.data.len() && self.data.contains(index) {
             self.len -= 1;
-            self.data.set(index, false);
+            self.data.remove(index);
             true
         } else {
             false
@@ -2416,7 +2546,7 @@ impl<'id, N: NodeBase, ET: Tag> oxidd_core::util::NodeSet<Edge<'id, N, ET>> for 
     }
 }
 
-/// === Additional Trait Implementations =======================================
+// === Additional Trait Implementations ========================================
 
 impl<
         'id,
@@ -2424,7 +2554,9 @@ impl<
         ET: Tag,
         TM: TerminalManager<'id, N, ET, TERMINALS>,
         R: DiagramRules<Edge<'id, N, ET>, N, TM::TerminalNode>,
-        MD: oxidd_core::HasApplyCache<Self, O> + GCContainer<Self> + DropWith<Edge<'id, N, ET>>,
+        MD: oxidd_core::HasApplyCache<Self, O>
+            + ManagerEventSubscriber<Self>
+            + DropWith<Edge<'id, N, ET>>,
         O: Copy,
         const TERMINALS: usize,
     > oxidd_core::HasApplyCache<Self, O> for Manager<'id, N, ET, TM, R, MD, TERMINALS>

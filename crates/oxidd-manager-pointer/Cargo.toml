@@ -1,14 +1,14 @@
 [package]
 name = "oxidd-manager-pointer"
-version = "0.2.0"
+version = "0.6.0"
 edition = "2021"
 description = "Pointer-based manager implementation for OxiDD"
 readme = "../../README.md"
 
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 
 [dependencies]
@@ -17,7 +17,7 @@ oxidd-core.workspace = true
 arcslab.workspace = true
 
 # strict provenance polyfill
-# (TODO: remove this once the `strict_provenance` feature becomes stable)
+# (TODO: remove this once we raise the MSRV to 1.84)
 sptr = "0.3"
 
 # fast alternative Mutex & RwLock implementation
@@ -27,13 +27,19 @@ parking_lot = "0.12"
 linear-hashtbl.workspace = true
 
 # fast hash function
-rustc-hash = "2"
+#
+# Note that there is a performance regression with 2.0, see
+# https://github.com/rust-lang/rustc-hash/issues/45
+rustc-hash = "1.1"
 
-# bit vectors
-bitvec = "1"
+# bit sets
+fixedbitset = "0.5.7"
 
 # thread pool
 rayon = "1.10"
+
+# standard derive macros but with custom bounds on generics
+derive-where = "1.5"
 
 
 [features]

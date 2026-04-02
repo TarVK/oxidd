@@ -3,11 +3,15 @@
 //#![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::type_complexity)]
-// We use const assertions for checking configurations and need to make sure
-// that they are evaluated
-#![allow(clippy::let_unit_value)]
 
 pub mod manager;
 pub mod node;
 pub mod terminal_manager;
-pub(crate) mod util;
+pub mod workers;
+
+mod util;
+
+#[cfg(target_pointer_width = "16")]
+compile_error!(
+    "oxidd-manager-pointer assumes that for all `x: u32`, `x as usize` does not truncate"
+);

@@ -13,7 +13,6 @@ use std::hash::Hash;
 use oxidd_core::util::{AllocResult, Borrowed};
 use oxidd_core::{DiagramRules, Edge, InnerNode, LevelNo, Manager, Node, ReducedOrNew};
 use oxidd_derive::Countable;
-use oxidd_dump::dddmp::AsciiDisplay;
 
 mod apply_rec;
 
@@ -23,10 +22,13 @@ mod apply_rec;
 pub struct TDDRules;
 
 impl<E: Edge, N: InnerNode<E>> DiagramRules<E, N, TDDTerminal> for TDDRules {
-    type Cofactors<'a> = N::ChildrenIter<'a> where N: 'a, E: 'a;
+    type Cofactors<'a>
+        = N::ChildrenIter<'a>
+    where
+        N: 'a,
+        E: 'a;
 
     #[inline]
-    #[must_use]
     fn reduce<M: Manager<Edge = E, InnerNode = N, Terminal = TDDTerminal>>(
         manager: &M,
         level: LevelNo,
@@ -48,7 +50,6 @@ impl<E: Edge, N: InnerNode<E>> DiagramRules<E, N, TDDTerminal> for TDDRules {
     }
 
     #[inline]
-    #[must_use]
     fn cofactors(_tag: E::Tag, node: &N) -> Self::Cofactors<'_> {
         node.children()
     }
@@ -98,24 +99,19 @@ impl std::ops::Not for TDDTerminal {
     }
 }
 
-/// Error returned when parsing a [`TDDTerminal`] from string fails
-#[derive(Debug, PartialEq, Eq)]
-pub struct ParseTerminalErr;
-
-impl std::str::FromStr for TDDTerminal {
-    type Err = ParseTerminalErr;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "f" | "F" | "false" | "False" | "FALSE" | "⊥" => Ok(TDDTerminal::False),
-            "u" | "U" | "unknown" | "Unknown" | "UNKNOWN" => Ok(TDDTerminal::Unknown),
-            "t" | "T" | "true" | "True" | "TRUE" | "⊤" => Ok(TDDTerminal::True),
-            _ => Err(ParseTerminalErr),
-        }
+impl<Tag: Default> oxidd_dump::ParseTagged<Tag> for TDDTerminal {
+    fn parse(s: &str) -> Option<(Self, Tag)> {
+        let val = match s {
+            "f" | "F" | "false" | "False" | "FALSE" | "⊥" | "0" => TDDTerminal::False,
+            "u" | "U" | "unknown" | "Unknown" | "UNKNOWN" | "?" => TDDTerminal::Unknown,
+            "t" | "T" | "true" | "True" | "TRUE" | "⊤" | "1" => TDDTerminal::True,
+            _ => return None,
+        };
+        Some((val, Tag::default()))
     }
 }
 
-impl AsciiDisplay for TDDTerminal {
+impl oxidd_dump::AsciiDisplay for TDDTerminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
             TDDTerminal::False => f.write_str("F"),
@@ -131,6 +127,16 @@ impl fmt::Display for TDDTerminal {
             TDDTerminal::False => f.write_str("⊥"),
             TDDTerminal::Unknown => f.write_str("U"),
             TDDTerminal::True => f.write_str("⊤"),
+        }
+    }
+}
+
+impl From<TDDTerminal> for Option<bool> {
+    fn from(value: TDDTerminal) -> Self {
+        match value {
+            TDDTerminal::False => Some(false),
+            TDDTerminal::Unknown => None,
+            TDDTerminal::True => Some(true),
         }
     }
 }
@@ -159,7 +165,9 @@ pub enum TDDOp {
 /// Collect the two children of a ternary node
 #[inline]
 #[must_use]
-fn collect_children<E: Edge, N: InnerNode<E>>(node: &N) -> (Borrowed<E>, Borrowed<E>, Borrowed<E>) {
+fn collect_children<E: Edge, N: InnerNode<E>>(
+    node: &N,
+) -> (Borrowed<'_, E>, Borrowed<'_, E>, Borrowed<'_, E>) {
     debug_assert_eq!(N::ARITY, 3);
     let mut it = node.children();
     let t = it.next().unwrap();

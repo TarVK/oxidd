@@ -2,6 +2,7 @@ use std::cell::UnsafeCell;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::mem::MaybeUninit;
+use std::sync::atomic;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Relaxed, Release};
 
@@ -34,8 +35,8 @@ impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize>
     const UNINIT_EDGE: MaybeUninit<manager::Edge<'id, Self, ET, TAG_BITS>> = MaybeUninit::uninit();
 }
 
-unsafe impl<'id, ET, const TAG_BITS: u32, const ARITY: usize> AtomicRefCounted
-    for NodeWithLevel<'id, ET, TAG_BITS, ARITY>
+unsafe impl<ET, const TAG_BITS: u32, const ARITY: usize> AtomicRefCounted
+    for NodeWithLevel<'_, ET, TAG_BITS, ARITY>
 {
     #[inline(always)]
     fn retain(&self) {
@@ -55,8 +56,8 @@ unsafe impl<'id, ET, const TAG_BITS: u32, const ARITY: usize> AtomicRefCounted
     }
 }
 
-impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize> PartialEq
-    for NodeWithLevel<'id, ET, TAG_BITS, ARITY>
+impl<ET: Tag, const TAG_BITS: u32, const ARITY: usize> PartialEq
+    for NodeWithLevel<'_, ET, TAG_BITS, ARITY>
 {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
@@ -64,13 +65,13 @@ impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize> PartialEq
         unsafe { *self.children.get() == *other.children.get() }
     }
 }
-impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize> Eq
-    for NodeWithLevel<'id, ET, TAG_BITS, ARITY>
+impl<ET: Tag, const TAG_BITS: u32, const ARITY: usize> Eq
+    for NodeWithLevel<'_, ET, TAG_BITS, ARITY>
 {
 }
 
-impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize> Hash
-    for NodeWithLevel<'id, ET, TAG_BITS, ARITY>
+impl<ET: Tag, const TAG_BITS: u32, const ARITY: usize> Hash
+    for NodeWithLevel<'_, ET, TAG_BITS, ARITY>
 {
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -79,13 +80,19 @@ impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize> Hash
     }
 }
 
-// SAFETY: The reference counter is initialized to 2.
-unsafe impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize> NodeBase
-    for NodeWithLevel<'id, ET, TAG_BITS, ARITY>
+// SAFETY: The reference counter is initialized to 2, `load_rc` uses the given
+// ordering.
+unsafe impl<ET: Tag, const TAG_BITS: u32, const ARITY: usize> NodeBase
+    for NodeWithLevel<'_, ET, TAG_BITS, ARITY>
 {
     #[inline(always)]
     fn needs_drop() -> bool {
         false
+    }
+
+    #[inline(always)]
+    fn load_rc(&self, order: atomic::Ordering) -> usize {
+        self.rc.load(order)
     }
 }
 
@@ -105,7 +112,12 @@ impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize>
 {
     const ARITY: usize = 2;
 
-    type ChildrenIter<'a> = BorrowedEdgeIter<'a, manager::Edge<'id, Self, ET, TAG_BITS>, std::slice::Iter<'a, manager::Edge<'id, Self, ET, TAG_BITS>>>
+    type ChildrenIter<'a>
+        = BorrowedEdgeIter<
+        'a,
+        manager::Edge<'id, Self, ET, TAG_BITS>,
+        std::slice::Iter<'a, manager::Edge<'id, Self, ET, TAG_BITS>>,
+    >
     where
         Self: 'a;
 
@@ -145,6 +157,15 @@ impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize>
     fn check_level(&self, check: impl FnOnce(LevelNo) -> bool) -> bool {
         check(self.level.load(Relaxed))
     }
+    #[inline(always)]
+    #[track_caller]
+    fn assert_level_matches(&self, level: LevelNo) {
+        assert_eq!(
+            self.level.load(Relaxed),
+            level,
+            "the level number does not match"
+        );
+    }
 
     #[inline(always)]
     fn children(&self) -> Self::ChildrenIter<'_> {
@@ -153,7 +174,7 @@ impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize>
     }
 
     #[inline(always)]
-    fn child(&self, n: usize) -> Borrowed<manager::Edge<'id, Self, ET, TAG_BITS>> {
+    fn child(&self, n: usize) -> Borrowed<'_, manager::Edge<'id, Self, ET, TAG_BITS>> {
         // SAFETY: we have shared access to the node
         let children = unsafe { &*self.children.get() };
         children[n].borrowed()
@@ -178,8 +199,8 @@ impl<'id, ET: Tag, const TAG_BITS: u32, const ARITY: usize>
     }
 }
 
-unsafe impl<'id, ET, const TAG_BITS: u32, const ARITY: usize> HasLevel
-    for NodeWithLevel<'id, ET, TAG_BITS, ARITY>
+unsafe impl<ET, const TAG_BITS: u32, const ARITY: usize> HasLevel
+    for NodeWithLevel<'_, ET, TAG_BITS, ARITY>
 {
     #[inline(always)]
     fn level(&self) -> LevelNo {
@@ -192,12 +213,12 @@ unsafe impl<'id, ET, const TAG_BITS: u32, const ARITY: usize> HasLevel
     }
 }
 
-unsafe impl<'id, ET: Send + Sync, const TAG_BITS: u32, const ARITY: usize> Send
-    for NodeWithLevel<'id, ET, TAG_BITS, ARITY>
+unsafe impl<ET: Send + Sync, const TAG_BITS: u32, const ARITY: usize> Send
+    for NodeWithLevel<'_, ET, TAG_BITS, ARITY>
 {
 }
-unsafe impl<'id, ET: Send + Sync, const TAG_BITS: u32, const ARITY: usize> Sync
-    for NodeWithLevel<'id, ET, TAG_BITS, ARITY>
+unsafe impl<ET: Send + Sync, const TAG_BITS: u32, const ARITY: usize> Sync
+    for NodeWithLevel<'_, ET, TAG_BITS, ARITY>
 {
 }
 

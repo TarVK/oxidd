@@ -1,12 +1,11 @@
 [package]
 name = "linear-hashtbl"
-version = "0.1.0"
+version = "0.1.4"
 edition = "2021"
 description = "Linear probing hash table"
 categories = ["data-structures"]
 keywords = ["hashmap", "hash"]
 
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -21,6 +20,9 @@ allocator-api2 = { version = "0.2", default-features = false, features = [
 [features]
 default = []
 
+# Allocator API support via allocator-api2. Has precedence over the `nightly`
+# feature
 allocator-api2 = ["dep:allocator-api2"]
 
-nightly = ["allocator-api2?/nightly"]
+# Unstable allocator API support
+nightly = []

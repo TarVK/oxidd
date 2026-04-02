@@ -1,7 +1,7 @@
 use std::hash::Hash;
 
-use oxidd_core::util::{Borrowed, GCContainer};
-use oxidd_core::Manager;
+use oxidd_core::util::Borrowed;
+use oxidd_core::{Manager, ManagerEventSubscriber};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "apply-cache-direct-mapped")] {
@@ -32,6 +32,7 @@ pub(crate) unsafe fn new_apply_cache<M: Manager, O: Copy + Ord + Hash, const ARI
     }
 }
 
+#[allow(unused)]
 pub struct NoApplyCache<M, O, const ARITY: usize>(pub std::marker::PhantomData<(M, O)>);
 
 impl<M: Manager, O: Copy, const ARITY: usize> oxidd_core::util::DropWith<M::Edge>
@@ -43,7 +44,7 @@ impl<M: Manager, O: Copy, const ARITY: usize> oxidd_core::util::DropWith<M::Edge
     }
 }
 
-impl<M: Manager, O, const ARITY: usize> GCContainer<M> for NoApplyCache<M, O, ARITY> {
+impl<M: Manager, O, const ARITY: usize> ManagerEventSubscriber<M> for NoApplyCache<M, O, ARITY> {
     fn pre_gc(&self, _manager: &M) {
         // Nothing to do
     }
@@ -72,9 +73,9 @@ impl<M: Manager, O: Copy, const ARITY: usize> oxidd_core::ApplyCache<M, O>
         &self,
         _manager: &M,
         _operator: O,
-        _operands: &[Borrowed<<M as Manager>::Edge>],
+        _operands: &[Borrowed<M::Edge>],
         _numeric_operands: &[u32],
-        _value: Borrowed<<M as Manager>::Edge>,
+        _value: Borrowed<M::Edge>,
     ) {
         // Just forget about it
     }

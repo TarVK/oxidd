@@ -1,8 +1,12 @@
 //! Recursive single-threaded apply algorithms
 
-use oxidd_core::function::{EdgeOfFunc, Function, NumberBase, PseudoBooleanFunction};
+use std::borrow::Borrow;
+
+use fixedbitset::FixedBitSet;
+
+use oxidd_core::function::{EdgeOfFunc, Function, INodeOfFunc, NumberBase, PseudoBooleanFunction};
 use oxidd_core::util::{AllocResult, Borrowed, EdgeDropGuard};
-use oxidd_core::{ApplyCache, Edge, HasApplyCache, HasLevel, InnerNode, Manager, Tag};
+use oxidd_core::{ApplyCache, Edge, HasApplyCache, HasLevel, InnerNode, Manager, Node, Tag, VarNo};
 use oxidd_derive::Function;
 use oxidd_dump::dot::DotStyle;
 
@@ -80,6 +84,7 @@ impl<M: Manager + HasApplyCache<M, MTBDDOp>> HasMTBDDOpApplyCache<M> for M {}
 
 /// Boolean function backed by a binary decision diagram
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Function, Debug)]
+#[repr_id = "MTBDD"]
 #[repr(transparent)]
 pub struct MTBDDFunction<F: Function>(F);
 
@@ -101,7 +106,7 @@ impl<F: Function> MTBDDFunction<F> {
 impl<F: Function, T: NumberBase> PseudoBooleanFunction for MTBDDFunction<F>
 where
     for<'id> F::Manager<'id>: Manager<Terminal = T> + HasMTBDDOpApplyCache<F::Manager<'id>>,
-    for<'id> <F::Manager<'id> as Manager>::InnerNode: HasLevel,
+    for<'id> INodeOfFunc<'id, F>: HasLevel,
 {
     type Number = T;
 
@@ -114,12 +119,17 @@ where
     }
 
     #[inline]
-    fn new_var<'id>(manager: &mut Self::Manager<'id>) -> AllocResult<Self> {
+    fn var_edge<'id>(
+        manager: &Self::Manager<'id>,
+        var: VarNo,
+    ) -> AllocResult<EdgeOfFunc<'id, Self>> {
+        let level = manager.var_to_level(var);
         let t = EdgeDropGuard::new(manager, manager.get_terminal(T::one())?);
         let e = EdgeDropGuard::new(manager, manager.get_terminal(T::zero())?);
-        let children = [t.into_edge(), e.into_edge()];
-        let edge = manager.add_level(|level| InnerNode::new(level, children))?;
-        Ok(Self::from_edge(manager, edge))
+        oxidd_core::LevelView::get_or_insert(
+            &mut manager.level(level),
+            InnerNode::new(level, [t.into_edge(), e.into_edge()]),
+        )
     }
 
     #[inline]
@@ -174,6 +184,37 @@ where
         rhs: &EdgeOfFunc<'id, Self>,
     ) -> AllocResult<EdgeOfFunc<'id, Self>> {
         apply_bin::<_, T, { MTBDDOp::Max as u8 }>(manager, lhs.borrowed(), rhs.borrowed())
+    }
+
+    #[inline]
+    fn eval_edge<'id>(
+        manager: &Self::Manager<'id>,
+        edge: &EdgeOfFunc<'id, Self>,
+        args: impl IntoIterator<Item = (VarNo, bool)>,
+    ) -> T {
+        // `choices` maps levels to the child number to choose
+        let mut choices = FixedBitSet::with_capacity(manager.num_levels() as usize);
+        for (var, val) in args {
+            // child 0 is "then"/"true", hence the negation
+            choices.set(manager.var_to_level(var) as usize, !val);
+        }
+
+        #[inline] // this function is tail-recursive
+        fn inner<M, T: Clone>(manager: &M, edge: Borrowed<M::Edge>, choices: &FixedBitSet) -> T
+        where
+            M: Manager<Terminal = T>,
+            M::InnerNode: HasLevel,
+        {
+            match manager.get_node(&edge) {
+                Node::Inner(node) => {
+                    let edge = node.child(choices.contains(node.level() as usize) as usize);
+                    inner(manager, edge, choices)
+                }
+                Node::Terminal(t) => t.borrow().clone(),
+            }
+        }
+
+        inner(manager, edge.borrowed(), &choices)
     }
 }
 

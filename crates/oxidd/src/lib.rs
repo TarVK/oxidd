@@ -12,27 +12,18 @@ std::compile_error!(
     "Either feature `manager-index` or `manager-pointer` must be enabled for this crate"
 );
 
+pub use oxidd_core::error;
 pub use oxidd_core::function::{
     BooleanFunction, BooleanFunctionQuant, BooleanOperator, BooleanVecSet, Function, FunctionSubst,
     NumberBase, PseudoBooleanFunction, TVLFunction,
 };
 pub use oxidd_core::util::{Subst, Substitution};
-pub use oxidd_core::{Edge, InnerNode, LevelNo, Manager, ManagerRef, NodeID, WorkerManager};
+pub use oxidd_core::{
+    Edge, HasLevel, HasWorkers, InnerNode, LevelNo, Manager, ManagerRef, Node, NodeID, VarNo,
+    WorkerPool,
+};
 
 pub mod util;
-
-#[deprecated = "use AllocResult from the oxidd::util module"]
-#[doc(hidden)]
-pub type AllocResult<T> = util::AllocResult<T>;
-#[deprecated = "use OptBool from the oxidd::util module"]
-#[doc(hidden)]
-pub type OptBool = util::OptBool;
-#[deprecated = "use OutOfMemory from the oxidd::util module"]
-#[doc(hidden)]
-pub type OutOfMemory = util::OutOfMemory;
-#[deprecated = "use SatCountCache from the oxidd::util module"]
-#[doc(hidden)]
-pub type SatCountCache<N, S> = util::SatCountCache<N, S>;
 
 #[cfg(feature = "bcdd")]
 pub mod bcdd;

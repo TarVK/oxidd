@@ -7,13 +7,15 @@ if(DOXYGEN)
 
     # TAGFILE for linking to cppreference.com (see https://stackoverflow.com/a/44743279)
     FetchContent_Declare(cppreference_tags
-        URL https://upload.cppreference.com/mwiki/images/f/f8/cppreference-doxygen-web.tag.xml
+        # The following URL is (currently) not working, so we (temporarily) use our mirror below
+        #URL https://upload.cppreference.com/mwiki/images/f/f8/cppreference-doxygen-web.tag.xml
+        URL https://gist.github.com/nhusung/775983575011a003b21ee93ca789756e/raw/4e6c1abe65b607fb0e8d9a53e9ca3a00a75c1446/cppreference-doxygen-web.tag.xml
         #DOWNLOAD_DIR ${CMAKE_CURRENT_BINARY_DIR}
         DOWNLOAD_NO_EXTRACT ON)
 
     FetchContent_Declare(doxygen_awesome_css
         GIT_REPOSITORY https://github.com/jothepro/doxygen-awesome-css.git
-        GIT_TAG v2.3.3)
+        GIT_TAG v2.4.0)
 
     FetchContent_MakeAvailable(cppreference_tags doxygen_awesome_css)
 

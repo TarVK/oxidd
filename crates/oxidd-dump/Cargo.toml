@@ -1,32 +1,36 @@
 [package]
 name = "oxidd-dump"
-version = "0.2.0"
+version = "0.6.0"
 edition = "2021"
 description = "Dump OxiDD decision diagrams to file"
 readme = "../../README.md"
 categories = ["visualization", "encoding"]
 
 
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 
 [dependencies]
 oxidd-core.workspace = true
+oxidd-derive.workspace = true
 
-# bit vectors
-bitvec = { version = "1", optional = true }
+# bit sets
+fixedbitset = { version = "0.5.7", optional = true }
 
 # fast hash function
-rustc-hash = { version = "2", optional = true }
+#
+# Note that there is a performance regression with 2.0, see
+# https://github.com/rust-lang/rustc-hash/issues/45
+rustc-hash = { version = "1.1", optional = true }
 
 # optimized searching for characters in &[u8]
 memchr = { version = "2", optional = true }
 
 # check whether an iterator is sorted
-# TODO: remove this once `is_sorted` becomes stable
+# (TODO: remove this once we raise the MSRV to 1.82)
 is_sorted = { version = "0.1", optional = true }
 
 # document feature flags
@@ -40,10 +44,10 @@ minreq = { version = "2.12.0", optional = true }
 default = ["dddmp", "dot", "visualize"]
 
 ## DDDMP format originally from CUDD
-dddmp = ["bitvec", "rustc-hash", "memchr", "is_sorted"]
+dddmp = ["dep:fixedbitset", "dep:rustc-hash", "dep:memchr", "dep:is_sorted"]
 
-## Visualization using dot
+## Visualization using Graphviz DOT
 dot = []
 
-## Visualization using viz tool
-visualize = ["minreq"]
+## Visualization using OxiDD-vis
+visualize = ["dddmp"]

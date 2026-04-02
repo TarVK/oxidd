@@ -1,6 +1,5 @@
 use std::cell::UnsafeCell;
-use std::hash::Hash;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -9,17 +8,14 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 use crossbeam_utils::CachePadded;
 use linear_hashtbl::raw::RawTable;
-use oxidd_core::util::OutOfMemory;
-use parking_lot::Mutex;
-use parking_lot::MutexGuard;
+use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHasher;
 
+use oxidd_core::error::OutOfMemory;
 use oxidd_core::util::AllocResult;
 use oxidd_core::Tag;
 
-use crate::manager::Edge;
-use crate::manager::InnerNodeCons;
-use crate::manager::TerminalManagerCons;
+use crate::manager::{Edge, InnerNodeCons, TerminalManagerCons};
 use crate::node::NodeBase;
 
 use super::TerminalManager;
@@ -77,7 +73,7 @@ fn hash<T: Hash>(terminal: &T) -> u64 {
     hasher.finish()
 }
 
-impl<'id, T, N, ET, const TERMINALS: usize> DynamicTerminalManager<'id, T, N, ET, TERMINALS> {
+impl<T, N, ET, const TERMINALS: usize> DynamicTerminalManager<'_, T, N, ET, TERMINALS> {
     const CHECK_TERMINALS: () = assert!(
         TERMINALS < (1 << (u32::BITS - 1)),
         "`TERMINALS` is too large"
@@ -92,14 +88,19 @@ where
     ET: Tag,
 {
     type TerminalNode = T;
-    type TerminalNodeRef<'a> = &'a T where Self: 'a;
-
-    type Iterator<'a> = DynamicTerminalIterator<'a, 'id, T, N, ET>
+    type TerminalNodeRef<'a>
+        = &'a T
     where
-        Self: 'a, 'id: 'a;
+        Self: 'a;
+
+    type Iterator<'a>
+        = DynamicTerminalIterator<'a, 'id, T, N, ET>
+    where
+        Self: 'a,
+        'id: 'a;
 
     fn with_capacity(capacity: u32) -> Self {
-        let _ = Self::CHECK_TERMINALS;
+        let () = Self::CHECK_TERMINALS;
         let capacity = std::cmp::min(TERMINALS, capacity as usize);
 
         let mut store_vec = Vec::new();
@@ -247,12 +248,12 @@ where
     }
 }
 
-unsafe impl<'id, T: Send + Sync, N: Send + Sync, ET: Send + Sync, const TERMINALS: usize> Send
-    for DynamicTerminalManager<'id, T, N, ET, TERMINALS>
+unsafe impl<T: Send + Sync, N: Send + Sync, ET: Send + Sync, const TERMINALS: usize> Send
+    for DynamicTerminalManager<'_, T, N, ET, TERMINALS>
 {
 }
-unsafe impl<'id, T: Send + Sync, N: Send + Sync, ET: Send + Sync, const TERMINALS: usize> Sync
-    for DynamicTerminalManager<'id, T, N, ET, TERMINALS>
+unsafe impl<T: Send + Sync, N: Send + Sync, ET: Send + Sync, const TERMINALS: usize> Sync
+    for DynamicTerminalManager<'_, T, N, ET, TERMINALS>
 {
 }
 
@@ -276,7 +277,7 @@ pub struct DynamicTerminalIterator<'a, 'id, T, N, ET> {
     len: usize,
 }
 
-impl<'a, 'id, T, N: NodeBase, ET: Tag> Iterator for DynamicTerminalIterator<'a, 'id, T, N, ET> {
+impl<'id, T, N: NodeBase, ET: Tag> Iterator for DynamicTerminalIterator<'_, 'id, T, N, ET> {
     type Item = Edge<'id, N, ET>;
 
     #[inline(always)]
@@ -308,14 +309,9 @@ impl<'a, 'id, T, N: NodeBase, ET: Tag> Iterator for DynamicTerminalIterator<'a, 
     }
 }
 
-impl<'a, 'id, T, N: NodeBase, ET: Tag> FusedIterator
-    for DynamicTerminalIterator<'a, 'id, T, N, ET>
-{
-}
+impl<T, N: NodeBase, ET: Tag> FusedIterator for DynamicTerminalIterator<'_, '_, T, N, ET> {}
 
-impl<'a, 'id, T, N: NodeBase, ET: Tag> ExactSizeIterator
-    for DynamicTerminalIterator<'a, 'id, T, N, ET>
-{
+impl<T, N: NodeBase, ET: Tag> ExactSizeIterator for DynamicTerminalIterator<'_, '_, T, N, ET> {
     #[inline(always)]
     fn len(&self) -> usize {
         self.len

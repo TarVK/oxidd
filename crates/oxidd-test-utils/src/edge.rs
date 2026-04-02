@@ -5,24 +5,16 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::hash::Hash;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::Arc;
 
-use oxidd_core::util::AllocResult;
-use oxidd_core::util::Borrowed;
-use oxidd_core::util::DropWith;
-use oxidd_core::BroadcastContext;
-use oxidd_core::DiagramRules;
-use oxidd_core::Edge;
-use oxidd_core::InnerNode;
-use oxidd_core::LevelNo;
-use oxidd_core::LevelView;
-use oxidd_core::Manager;
-use oxidd_core::Node;
-use oxidd_core::NodeID;
-use oxidd_core::ReducedOrNew;
-use oxidd_core::WorkerManager;
+use oxidd_core::error::DuplicateVarName;
+use oxidd_core::util::{AllocResult, Borrowed, DropWith};
+use oxidd_core::{
+    DiagramRules, Edge, HasWorkers, InnerNode, LevelNo, LevelView, Manager, Node, NodeID,
+    ReducedOrNew, VarNo,
+};
 
 /// Simple dummy edge implementation based on [`Arc`]
 ///
@@ -132,13 +124,22 @@ unsafe impl Manager for DummyManager {
     type InnerNode = DummyNode;
     type Terminal = ();
     type TerminalRef<'a> = &'a ();
-    type TerminalIterator<'a> = std::iter::Empty<DummyEdge> where Self: 'a;
     type Rules = DummyRules;
+    type TerminalIterator<'a>
+        = std::iter::Empty<DummyEdge>
+    where
+        Self: 'a;
     type NodeSet = HashSet<NodeID>;
-    type LevelView<'a> = DummyLevelView where Self: 'a;
-    type LevelIterator<'a> = std::iter::Empty<DummyLevelView> where Self: 'a;
+    type LevelView<'a>
+        = DummyLevelView
+    where
+        Self: 'a;
+    type LevelIterator<'a>
+        = std::iter::Empty<DummyLevelView>
+    where
+        Self: 'a;
 
-    fn get_node(&self, _edge: &Self::Edge) -> Node<Self> {
+    fn get_node(&self, _edge: &Self::Edge) -> Node<'_, Self> {
         Node::Inner(&DummyNode)
     }
 
@@ -149,9 +150,17 @@ unsafe impl Manager for DummyManager {
     fn drop_edge(&self, edge: Self::Edge) {
         // Move the inner arc out. We need to use `std::ptr::read` since
         // `DummyEdge` implements `Drop` (to print an error).
-        let inner = unsafe { std::ptr::read(&edge.0) };
+        let arc = unsafe { std::ptr::read(&edge.0) };
         std::mem::forget(edge);
-        drop(inner);
+        drop(arc);
+    }
+
+    fn try_remove_node(&self, edge: Self::Edge, _level: LevelNo) -> bool {
+        // Move the inner arc out. We need to use `std::ptr::read` since
+        // `DummyEdge` implements `Drop` (to print an error).
+        let arc = unsafe { std::ptr::read(&edge.0) };
+        std::mem::forget(edge);
+        Arc::into_inner(arc).is_some()
     }
 
     fn num_inner_nodes(&self) -> usize {
@@ -162,11 +171,43 @@ unsafe impl Manager for DummyManager {
         0
     }
 
-    fn add_level(
-        &mut self,
-        _f: impl FnOnce(LevelNo) -> Self::InnerNode,
-    ) -> AllocResult<Self::Edge> {
+    fn num_named_vars(&self) -> VarNo {
+        0
+    }
+
+    fn add_vars(&mut self, _additional: VarNo) -> Range<VarNo> {
         unimplemented!()
+    }
+
+    fn add_named_vars<S: Into<String>>(
+        &mut self,
+        _names: impl IntoIterator<Item = S>,
+    ) -> Result<Range<VarNo>, DuplicateVarName> {
+        unimplemented!()
+    }
+
+    fn var_name(&self, _var: VarNo) -> &str {
+        panic!("out of range")
+    }
+
+    fn set_var_name(
+        &mut self,
+        _var: VarNo,
+        _name: impl Into<String>,
+    ) -> Result<(), DuplicateVarName> {
+        panic!("out of range")
+    }
+
+    fn name_to_var(&self, _name: impl AsRef<str>) -> Option<VarNo> {
+        None
+    }
+
+    fn var_to_level(&self, _var: VarNo) -> LevelNo {
+        panic!("out of range")
+    }
+
+    fn level_to_var(&self, _level: LevelNo) -> VarNo {
+        panic!("out of range")
     }
 
     fn level(&self, _no: LevelNo) -> Self::LevelView<'_> {
@@ -197,41 +238,20 @@ unsafe impl Manager for DummyManager {
         f(self)
     }
 
+    fn gc_count(&self) -> u64 {
+        0
+    }
+
     fn reorder_count(&self) -> u64 {
         0
     }
 }
 
-impl WorkerManager for DummyManager {
-    fn current_num_threads(&self) -> usize {
-        rayon::current_num_threads()
-    }
+impl HasWorkers for DummyManager {
+    type WorkerPool = crate::Workers;
 
-    fn split_depth(&self) -> u32 {
-        42
-    }
-
-    fn set_split_depth(&self, _depth: Option<u32>) {}
-
-    fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
-        op()
-    }
-
-    fn join<RA: Send, RB: Send>(
-        &self,
-        op_a: impl FnOnce() -> RA + Send,
-        op_b: impl FnOnce() -> RB + Send,
-    ) -> (RA, RB) {
-        rayon::join(op_a, op_b)
-    }
-
-    fn broadcast<R: Send>(&self, op: impl Fn(oxidd_core::BroadcastContext) -> R + Sync) -> Vec<R> {
-        rayon::broadcast(|ctx| {
-            op(BroadcastContext {
-                index: ctx.index() as u32,
-                num_threads: ctx.num_threads() as u32,
-            })
-        })
+    fn workers(&self) -> &Self::WorkerPool {
+        &crate::Workers
     }
 }
 
@@ -239,7 +259,8 @@ impl WorkerManager for DummyManager {
 pub struct DummyLevelView;
 
 unsafe impl LevelView<DummyEdge, DummyNode> for DummyLevelView {
-    type Iterator<'a> = std::iter::Empty<&'a DummyEdge>
+    type Iterator<'a>
+        = std::iter::Empty<&'a DummyEdge>
     where
         Self: 'a,
         DummyEdge: 'a;
@@ -270,11 +291,11 @@ unsafe impl LevelView<DummyEdge, DummyNode> for DummyLevelView {
         unreachable!()
     }
 
-    unsafe fn gc(&mut self) {
+    fn gc(&mut self) {
         unreachable!()
     }
 
-    unsafe fn remove(&mut self, _node: &DummyNode) -> bool {
+    fn remove(&mut self, _node: &DummyNode) -> bool {
         unreachable!()
     }
 
@@ -304,7 +325,8 @@ impl DropWith<DummyEdge> for DummyNode {
 impl InnerNode<DummyEdge> for DummyNode {
     const ARITY: usize = 0;
 
-    type ChildrenIter<'a> = std::iter::Empty<Borrowed<'a, DummyEdge>>
+    type ChildrenIter<'a>
+        = std::iter::Empty<Borrowed<'a, DummyEdge>>
     where
         Self: 'a;
 
@@ -315,12 +337,13 @@ impl InnerNode<DummyEdge> for DummyNode {
     fn check_level(&self, _check: impl FnOnce(LevelNo) -> bool) -> bool {
         true
     }
+    fn assert_level_matches(&self, _level: LevelNo) {}
 
     fn children(&self) -> Self::ChildrenIter<'_> {
         std::iter::empty()
     }
 
-    fn child(&self, _n: usize) -> Borrowed<DummyEdge> {
+    fn child(&self, _n: usize) -> Borrowed<'_, DummyEdge> {
         unimplemented!()
     }
 

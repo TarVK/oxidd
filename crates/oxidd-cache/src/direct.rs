@@ -2,20 +2,14 @@
 
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::hash::Hash;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 
-use oxidd_core::util::GCContainer;
 use parking_lot::lock_api::RawMutex;
 
-use oxidd_core::util::Borrowed;
-use oxidd_core::util::DropWith;
-use oxidd_core::ApplyCache;
-use oxidd_core::Edge;
-use oxidd_core::Manager;
+use oxidd_core::util::{Borrowed, DropWith};
+use oxidd_core::{ApplyCache, Edge, Manager, ManagerEventSubscriber};
 
 #[cfg(feature = "hugealloc")]
 type Box<T> = allocator_api2::boxed::Box<T, hugealloc::HugeAlloc>;
@@ -60,8 +54,8 @@ impl<E> Operand<E> {
 
     fn write_edge(&mut self, edge: Borrowed<E>) {
         // SAFETY: The referenced node lives at least until the next garbage
-        // collection / reordering. Before this operation garbage
-        // collection, we clear the entire cache.
+        // collection / reordering. Before that operation, we clear the entire
+        // cache.
         self.edge = unsafe { Borrowed::into_inner(edge) };
     }
 
@@ -83,7 +77,7 @@ struct Entry<M: Manager, O, const ARITY: usize> {
     /// Operands of the key. The first `edge_operands` elements are edges, the
     /// following `numeric_operands` are numeric.
     operands: UnsafeCell<[Operand<M::Edge>; ARITY]>,
-    /// Initialized if `arity != 0`
+    /// Initialized if `edge_operands != 0`
     value: UnsafeCell<MaybeUninit<M::Edge>>,
 }
 
@@ -94,26 +88,26 @@ unsafe impl<M: Manager, O: Send, const ARITY: usize> Send for Entry<M, O, ARITY>
 unsafe impl<M: Manager, O: Send, const ARITY: usize> Sync for Entry<M, O, ARITY> where M::Edge: Send {}
 
 impl<M: Manager, O: Copy + Eq, const ARITY: usize> Entry<M, O, ARITY> {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            mutex: crate::util::RawMutex::INIT,
-            operator: UnsafeCell::new(MaybeUninit::uninit()),
-            edge_operands: UnsafeCell::new(0),
-            numeric_operands: UnsafeCell::new(0),
-            operands: UnsafeCell::new([Operand::UNINIT; ARITY]),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
+    // Regarding the lint: the intent here is not to modify the `AtomicBool` in
+    // a const context but to create the `RawMutex` in a const context.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: Self = Self {
+        mutex: crate::util::RawMutex::INIT,
+        operator: UnsafeCell::new(MaybeUninit::uninit()),
+        edge_operands: UnsafeCell::new(0),
+        numeric_operands: UnsafeCell::new(0),
+        operands: UnsafeCell::new([Operand::UNINIT; ARITY]),
+        value: UnsafeCell::new(MaybeUninit::uninit()),
+    };
 
     #[inline]
-    fn lock(&self) -> EntryGuard<M, O, ARITY> {
+    fn lock(&self) -> EntryGuard<'_, M, O, ARITY> {
         self.mutex.lock();
         EntryGuard(self)
     }
 
     #[inline]
-    fn try_lock(&self) -> Option<EntryGuard<M, O, ARITY>> {
+    fn try_lock(&self) -> Option<EntryGuard<'_, M, O, ARITY>> {
         if self.mutex.try_lock() {
             Some(EntryGuard(self))
         } else {
@@ -122,7 +116,7 @@ impl<M: Manager, O: Copy + Eq, const ARITY: usize> Entry<M, O, ARITY> {
     }
 }
 
-impl<'a, M: Manager, O, const ARITY: usize> Drop for EntryGuard<'a, M, O, ARITY> {
+impl<M: Manager, O, const ARITY: usize> Drop for EntryGuard<'_, M, O, ARITY> {
     #[inline]
     fn drop(&mut self) {
         // SAFETY: The entry is locked.
@@ -130,7 +124,7 @@ impl<'a, M: Manager, O, const ARITY: usize> Drop for EntryGuard<'a, M, O, ARITY>
     }
 }
 
-impl<'a, M: Manager, O, const ARITY: usize> EntryGuard<'a, M, O, ARITY>
+impl<M: Manager, O, const ARITY: usize> EntryGuard<'_, M, O, ARITY>
 where
     O: Copy + Eq,
 {
@@ -201,7 +195,9 @@ where
     /// If `self` is already occupied and the key matches, the entry is not
     /// updated (`operands` and `value` are not cloned).
     ///
-    /// Assumes that `operands.len() + numeric_operands.len() <= ARITY`
+    /// Assumes that
+    /// - `!operands.is_empty()`
+    /// - `operands.len() + numeric_operands.len() <= ARITY`
     #[inline]
     fn set(
         &mut self,
@@ -212,6 +208,7 @@ where
         value: Borrowed<M::Edge>,
     ) {
         debug_assert_ne!(operands.len(), 0);
+        debug_assert!(operands.len() + numeric_operands.len() <= ARITY);
         self.clear();
 
         #[cfg(feature = "statistics")]
@@ -272,10 +269,11 @@ where
     /// # Safety
     ///
     /// The apply cache must only be used inside a manager that guarantees all
-    /// node deletions to be wrapped inside an [`GCContainer::pre_gc()`] /
-    /// [`GCContainer::post_gc()`] pair.
+    /// node deletions to be wrapped inside an
+    /// [`ManagerEventSubscriber::pre_gc()`] /
+    /// [`ManagerEventSubscriber::post_gc()`] pair.
     pub unsafe fn with_capacity(capacity: usize) -> Self {
-        let _ = Self::CHECK_ARITY;
+        let () = Self::CHECK_ARITY;
         let buckets = capacity
             .checked_next_power_of_two()
             .expect("capacity is too large");
@@ -284,10 +282,7 @@ where
         #[cfg(feature = "hugealloc")]
         let mut vec = Vec::with_capacity_in(buckets, hugealloc::HugeAlloc);
 
-        for _ in 0..buckets {
-            vec.push(Entry::new())
-        }
-
+        vec.resize_with(buckets, || Entry::INIT);
         DMApplyCache(vec.into_boxed_slice(), PhantomData)
     }
 
@@ -390,7 +385,7 @@ where
     }
 }
 
-impl<M, O, H, const ARITY: usize> GCContainer<M> for DMApplyCache<M, O, H, ARITY>
+impl<M, O, H, const ARITY: usize> ManagerEventSubscriber<M> for DMApplyCache<M, O, H, ARITY>
 where
     M: Manager,
     O: Copy + Hash + Ord,
@@ -436,7 +431,7 @@ where
     }
 }
 
-impl<'a, M, O, const ARITY: usize> fmt::Debug for EntryGuard<'a, M, O, ARITY>
+impl<M, O, const ARITY: usize> fmt::Debug for EntryGuard<'_, M, O, ARITY>
 where
     M: Manager,
     M::Edge: fmt::Debug,
@@ -451,7 +446,7 @@ where
             // SAFETY: The entry is locked and occupied.
             let operator = unsafe { (*self.0.operator.get()).assume_init() };
             // SAFETY: The entry is locked.
-            let operands = unsafe { &(*self.0.operands.get())[..edge_operands] };
+            let operands = unsafe { &(&*self.0.operands.get())[..edge_operands] };
             // SAFETY: The first `arity` (> 0) operands are initialized.
             write!(f, "{{{{ {operator:?}({:?}", unsafe {
                 operands[0].assume_edge_ref()

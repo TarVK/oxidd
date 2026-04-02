@@ -29,14 +29,13 @@ pub struct StaticTerminalManager<
 >(PhantomData<(&'id (), Terminal, InnerNode, EdgeTag, ManagerData)>);
 
 impl<
-        'id,
         Terminal: Countable,
         InnerNode,
         EdgeTag: Tag,
         ManagerData,
         const PAGE_SIZE: usize,
         const TAG_BITS: u32,
-    > StaticTerminalManager<'id, Terminal, InnerNode, EdgeTag, ManagerData, PAGE_SIZE, TAG_BITS>
+    > StaticTerminalManager<'_, Terminal, InnerNode, EdgeTag, ManagerData, PAGE_SIZE, TAG_BITS>
 {
     /// All "info" bits of edges: `TAG_BITS` for the `EdgeTag`, one bit for
     /// inner/terminal node, and `bit_width(Terminal::MAX_VALUE)` bits for the
@@ -76,15 +75,20 @@ where
     EdgeTag: Tag,
 {
     type TerminalNode = Terminal;
-    type TerminalNodeRef<'a> = Terminal where Self: 'a;
-
-    type Iterator<'a> = StaticTerminalIterator<'id, InnerNode, EdgeTag, TAG_BITS>
+    type TerminalNodeRef<'a>
+        = Terminal
     where
-        Self: 'a, 'id: 'a;
+        Self: 'a;
+
+    type Iterator<'a>
+        = StaticTerminalIterator<'id, InnerNode, EdgeTag, TAG_BITS>
+    where
+        Self: 'a,
+        'id: 'a;
 
     #[inline(always)]
     unsafe fn new_in(_slot: *mut Self) {
-        let _ = Self::ASSERT_SUFFICIENT_ALIGN;
+        let () = Self::ASSERT_SUFFICIENT_ALIGN;
     }
 
     #[inline]
@@ -126,7 +130,7 @@ where
         terminal: Terminal,
     ) -> AllocResult<Edge<'id, InnerNode, EdgeTag, TAG_BITS>> {
         let ptr = sptr::Strict::map_addr(this as *mut (), |p| {
-            p | 1 << Self::TERMINAL_BIT | terminal.as_usize() << Self::VAL_LSB
+            p | (1 << Self::TERMINAL_BIT) | (terminal.as_usize() << Self::VAL_LSB)
         });
         Ok(unsafe { Edge::from_ptr(NonNull::new_unchecked(ptr)) })
     }
@@ -136,7 +140,7 @@ where
     where
         Self: 'a,
     {
-        let first = sptr::Strict::map_addr(this as *mut (), |p| p | 1 << Self::TERMINAL_BIT);
+        let first = sptr::Strict::map_addr(this as *mut (), |p| p | (1 << Self::TERMINAL_BIT));
         StaticTerminalIterator::new(NonNull::new(first).unwrap(), Terminal::MAX_VALUE + 1)
     }
 
@@ -170,8 +174,8 @@ pub struct StaticTerminalIterator<'id, InnerNode, EdgeTag, const TAG_BITS: u32> 
     phantom: PhantomData<Edge<'id, InnerNode, EdgeTag, TAG_BITS>>,
 }
 
-impl<'id, InnerNode, EdgeTag, const TAG_BITS: u32>
-    StaticTerminalIterator<'id, InnerNode, EdgeTag, TAG_BITS>
+impl<InnerNode, EdgeTag, const TAG_BITS: u32>
+    StaticTerminalIterator<'_, InnerNode, EdgeTag, TAG_BITS>
 {
     const TERMINAL_BIT: u32 = TAG_BITS;
 
@@ -214,13 +218,13 @@ impl<'id, InnerNode: NodeBase, EdgeTag: Tag, const TAG_BITS: u32> Iterator
     }
 }
 
-impl<'id, InnerNode: NodeBase, EdgeTag: Tag, const TAG_BITS: u32> FusedIterator
-    for StaticTerminalIterator<'id, InnerNode, EdgeTag, TAG_BITS>
+impl<InnerNode: NodeBase, EdgeTag: Tag, const TAG_BITS: u32> FusedIterator
+    for StaticTerminalIterator<'_, InnerNode, EdgeTag, TAG_BITS>
 {
 }
 
-impl<'id, InnerNode: NodeBase, EdgeTag: Tag, const TAG_BITS: u32> ExactSizeIterator
-    for StaticTerminalIterator<'id, InnerNode, EdgeTag, TAG_BITS>
+impl<InnerNode: NodeBase, EdgeTag: Tag, const TAG_BITS: u32> ExactSizeIterator
+    for StaticTerminalIterator<'_, InnerNode, EdgeTag, TAG_BITS>
 {
     fn len(&self) -> usize {
         self.count

@@ -12,10 +12,10 @@ use std::hash::Hash;
 
 use oxidd_core::util::{AllocResult, Borrowed, DropWith};
 use oxidd_core::{
-    DiagramRules, Edge, HasLevel, InnerNode, LevelNo, LevelView, Manager, ReducedOrNew,
+    DiagramRules, Edge, HasLevel, InnerNode, LevelNo, LevelView, Manager, ManagerEventSubscriber,
+    ReducedOrNew,
 };
 use oxidd_derive::Countable;
-use oxidd_dump::dddmp::AsciiDisplay;
 
 // spell-checker:ignore symm
 
@@ -28,10 +28,13 @@ mod recursor;
 pub struct ZBDDRules;
 
 impl<E: Edge, N: InnerNode<E>> DiagramRules<E, N, ZBDDTerminal> for ZBDDRules {
-    type Cofactors<'a> = N::ChildrenIter<'a> where N: 'a, E: 'a;
+    type Cofactors<'a>
+        = N::ChildrenIter<'a>
+    where
+        N: 'a,
+        E: 'a;
 
     #[inline]
-    #[must_use]
     fn reduce<M: Manager<Edge = E, InnerNode = N, Terminal = ZBDDTerminal>>(
         manager: &M,
         level: LevelNo,
@@ -50,7 +53,6 @@ impl<E: Edge, N: InnerNode<E>> DiagramRules<E, N, ZBDDTerminal> for ZBDDRules {
     }
 
     #[inline]
-    #[must_use]
     fn cofactors(_tag: E::Tag, node: &N) -> Self::Cofactors<'_> {
         node.children()
     }
@@ -67,12 +69,17 @@ fn reduce<M>(
 where
     M: Manager<Terminal = ZBDDTerminal>,
 {
-    let _ = op;
-    let tmp = <ZBDDRules as DiagramRules<_, _, _>>::reduce(manager, level, [hi, lo]);
-    if let ReducedOrNew::Reduced(..) = &tmp {
+    // We do not use `DiagramRules::reduce()` here, as the iterator is
+    // apparently not fully optimized away.
+    if manager.get_node(&hi).is_terminal(&ZBDDTerminal::Empty) {
         stat!(reduced op);
+        manager.drop_edge(hi);
+        return Ok(lo);
     }
-    tmp.then_insert(manager, level)
+    oxidd_core::LevelView::get_or_insert(
+        &mut manager.level(level),
+        M::InnerNode::new(level, [hi, lo]),
+    )
 }
 
 #[inline(always)]
@@ -110,23 +117,18 @@ pub enum ZBDDTerminal {
     Base,
 }
 
-/// Error returned when parsing a [`ZBDDTerminal`] from string fails
-#[derive(Debug, PartialEq, Eq)]
-pub struct ParseTerminalErr;
-
-impl std::str::FromStr for ZBDDTerminal {
-    type Err = ParseTerminalErr;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "e" | "E" | "empty" | "Empty" | "EMPTY" | "∅" => Ok(ZBDDTerminal::Empty),
-            "b" | "B" | "base" | "Base" | "BASE" | "{∅}" => Ok(ZBDDTerminal::Base),
-            _ => Err(ParseTerminalErr),
-        }
+impl<Tag: Default> oxidd_dump::ParseTagged<Tag> for ZBDDTerminal {
+    fn parse(s: &str) -> Option<(Self, Tag)> {
+        let val = match s {
+            "e" | "E" | "empty" | "Empty" | "EMPTY" | "∅" | "0" => ZBDDTerminal::Empty,
+            "b" | "B" | "base" | "Base" | "BASE" | "{∅}" => ZBDDTerminal::Base,
+            _ => return None,
+        };
+        Some((val, Tag::default()))
     }
 }
 
-impl AsciiDisplay for ZBDDTerminal {
+impl oxidd_dump::AsciiDisplay for ZBDDTerminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
             ZBDDTerminal::Empty => f.write_str("E"),
@@ -150,6 +152,53 @@ pub struct ZBDDCache<E> {
     tautologies: Vec<E>,
 }
 
+impl<M> ManagerEventSubscriber<M> for ZBDDCache<M::Edge>
+where
+    M: Manager<Terminal = ZBDDTerminal> + HasZBDDCache<M::Edge>,
+{
+    #[inline(always)]
+    fn init_mut(manager: &mut M) {
+        Self::post_reorder_mut(manager);
+    }
+
+    fn pre_reorder_mut(manager: &mut M) {
+        // clear the cache top down
+        let mut ts = std::mem::take(&mut manager.zbdd_cache_mut().tautologies);
+        let mut level = 0;
+        while ts.len() > 1 {
+            if !manager.try_remove_node(ts.pop().unwrap(), level) {
+                break;
+            }
+            level += 1;
+        }
+        for e in ts.into_iter().rev() {
+            manager.drop_edge(e);
+        }
+    }
+
+    fn post_reorder_mut(manager: &mut M) {
+        // Build the tautologies bottom up
+        //
+        // Storing the edge for `ZBDDTerminal::Base` as well enables us to return
+        // `&E` instead of `E` in `Self::tautology()`, so we don't need as many
+        // clone/drop operations.
+        let mut tautologies = Vec::with_capacity(1 + manager.num_levels() as usize);
+        tautologies.push(manager.get_terminal(ZBDDTerminal::Base).unwrap());
+        for mut view in manager.levels().rev() {
+            let level = view.level_no();
+            let hi = manager.clone_edge(tautologies.last().unwrap());
+            let lo = manager.clone_edge(&hi);
+            let Ok(edge) = view.get_or_insert(M::InnerNode::new(level, [hi, lo])) else {
+                eprintln!("Out of memory");
+                std::process::abort();
+            };
+            tautologies.push(edge);
+        }
+
+        manager.zbdd_cache_mut().tautologies = tautologies;
+    }
+}
+
 pub trait HasZBDDCache<E: Edge> {
     fn zbdd_cache(&self) -> &ZBDDCache<E>;
     fn zbdd_cache_mut(&mut self) -> &mut ZBDDCache<E>;
@@ -167,7 +216,7 @@ impl<E: Edge, T: AsRef<ZBDDCache<E>> + AsMut<ZBDDCache<E>>> HasZBDDCache<E> for 
 
 impl<E: Edge> DropWith<E> for ZBDDCache<E> {
     fn drop_with(self, drop_edge: impl Fn(E)) {
-        for e in self.tautologies {
+        for e in self.tautologies.into_iter().rev() {
             drop_edge(e)
         }
     }
@@ -177,53 +226,8 @@ impl<E: Edge> ZBDDCache<E> {
     /// Create a new `ZBDDCache`
     pub fn new() -> Self {
         Self {
-            tautologies: vec![],
+            tautologies: Vec::new(),
         }
-    }
-
-    /// Rebuild the `ZBDDCache` of `manager`
-    ///
-    /// The logical semantics of ZBDD nodes is dependent on the set of
-    /// variables. The [`oxidd_core::function::BooleanFunction`]
-    /// implementation for [`ZBDDFunction`] assumes that this set of variables
-    /// is the set containing all variables. So if we add a new variable/level
-    /// to the diagram, the cache needs to be rebuilt.
-    /// [`ZBDDFunction::new_var()`][oxidd_core::function::BooleanFunction::new_var()]
-    /// and
-    /// [`ZBDDFunction::new_singleton()`][`oxidd_core::function::BooleanVecSet::new_singleton()`]
-    /// call this function automatically.
-    pub fn rebuild<M: Manager<Edge = E, Terminal = ZBDDTerminal> + HasZBDDCache<E>>(
-        manager: &mut M,
-    ) {
-        // We cannot have both `&mut Self` and `&M`, because we need a `&mut M`
-        // to obtain a `&mut Self` using `HasZBDDCache::zbdd_cache_mut()`.
-
-        let mut tautologies = std::mem::take(&mut manager.zbdd_cache_mut().tautologies);
-
-        // Clear the cache
-        for e in tautologies.drain(..) {
-            manager.drop_edge(e);
-        }
-
-        // Build the tautologies bottom up
-        //
-        // Storing the edge for `ZBDDTerminal::Base` as well enables us to return
-        // `&E` instead of `E` in `Self::tautology()`, so we don't need as many
-        // clone/drop operations.
-        tautologies.reserve(1 + manager.num_levels() as usize);
-        tautologies.push(manager.get_terminal(ZBDDTerminal::Base).unwrap());
-        for mut view in manager.levels().rev() {
-            let level = view.level_no();
-            let hi = manager.clone_edge(tautologies.last().unwrap());
-            let lo = manager.clone_edge(&hi);
-            let Ok(edge) = view.get_or_insert(M::InnerNode::new(level, [hi, lo])) else {
-                eprintln!("Out of memory");
-                std::process::abort();
-            };
-            tautologies.push(edge);
-        }
-
-        manager.zbdd_cache_mut().tautologies = tautologies;
     }
 
     /// Get the tautology for the set of variables at `level` and below
@@ -232,7 +236,10 @@ impl<E: Edge> ZBDDCache<E> {
         // The vector contains one entry for each level including the terminals.
         // The terminal level comes first, the top-most level last.
         let len = self.tautologies.len() as u32;
-        debug_assert!(len > 0, "Cache is empty. Maybe you forgot to rebuild it?");
+        debug_assert!(
+            len > 0,
+            "ZBDDCache is empty. This is an OxiDD-internal error."
+        );
         let rev_idx = std::cmp::min(len - 1, level);
         &self.tautologies[(len - 1 - rev_idx) as usize]
     }
@@ -271,7 +278,7 @@ pub enum ZBDDOp {
 /// Collect the two children of a binary node
 #[inline]
 #[must_use]
-fn collect_children<E: Edge, N: InnerNode<E>>(node: &N) -> (Borrowed<E>, Borrowed<E>) {
+fn collect_children<E: Edge, N: InnerNode<E>>(node: &N) -> (Borrowed<'_, E>, Borrowed<'_, E>) {
     debug_assert_eq!(N::ARITY, 2);
     let mut it = node.children();
     let hi = it.next().unwrap();
@@ -324,41 +331,33 @@ where
 /// Get the Boolean function v for the singleton set {v} (given by `singleton`)
 ///
 /// Panics if `singleton` is not a singleton set
+#[deprecated = "use `BooleanFunction::var` instead"]
 pub fn var_boolean_function<M>(manager: &M, singleton: &M::Edge) -> AllocResult<M::Edge>
 where
     M: Manager<Terminal = ZBDDTerminal> + HasZBDDCache<M::Edge>,
     M::InnerNode: HasLevel,
 {
     let level = singleton_level(manager, singleton);
-    let lo = manager.get_terminal(ZBDDTerminal::Empty)?;
     let hi = manager.clone_edge(manager.zbdd_cache().tautology(level + 1));
-    let edge = manager
-        .level(level)
-        .get_or_insert(M::InnerNode::new(level, [hi, lo]))?;
+    let lo = manager.get_terminal(ZBDDTerminal::Empty).unwrap();
+    let mut edge = oxidd_core::LevelView::get_or_insert(
+        &mut manager.level(level),
+        InnerNode::new(level, [hi, lo]),
+    )?;
 
-    #[inline] // function is tail-recursive
-    fn complete_chain<M>(manager: &M, level: LevelNo, edge: M::Edge) -> AllocResult<M::Edge>
-    where
-        M: Manager,
-        M::InnerNode: HasLevel,
-    {
-        let hi = edge;
-        let lo = manager.clone_edge(&hi);
-        let edge = manager
-            .level(level)
-            .get_or_insert(M::InnerNode::new(level, [hi, lo]))?;
-        if level == 0 {
-            Ok(edge)
-        } else {
-            complete_chain(manager, level - 1, edge)
-        }
+    // Build the chain bottom up. We need to skip the newly created level.
+    let levels = manager.levels().rev();
+    // skip -> for level 0, we are already done
+    for mut view in levels.skip((manager.num_levels() - level) as usize) {
+        // only use `oxidd_core::LevelView` here to mitigate confusion of Rust Analyzer
+        use oxidd_core::LevelView;
+
+        let level = view.level_no();
+        let edge2 = manager.clone_edge(&edge);
+        edge = view.get_or_insert(InnerNode::new(level, [edge, edge2]))?;
     }
 
-    if level == 0 {
-        Ok(edge)
-    } else {
-        complete_chain(manager, level - 1, edge)
-    }
+    Ok(edge)
 }
 
 // --- Function Interface ------------------------------------------------------

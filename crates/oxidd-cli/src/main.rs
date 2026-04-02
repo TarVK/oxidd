@@ -6,28 +6,27 @@ use std::fs;
 use std::hash::{BuildHasherDefault, Hash};
 use std::io;
 use std::io::{Seek, Write};
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use bitvec::prelude::*;
 use clap::{Parser, ValueEnum};
 use num_bigint::BigUint;
-use oxidd::util::{AllocResult, SatCountCache};
-use oxidd::{BooleanFunction, Edge, LevelNo, Manager, WorkerManager};
-use oxidd_core::{ApplyCache, HasApplyCache, HasLevel, ManagerRef};
+use oxidd::util::SatCountCache;
+use oxidd::{BooleanFunction, HasLevel, HasWorkers, Manager, ManagerRef, VarNo, WorkerPool};
+use oxidd_core::function::{ETagOfFunc, INodeOfFunc, TermOfFunc};
+use oxidd_core::util::VarNameMap;
+use oxidd_core::{ApplyCache, HasApplyCache};
 use oxidd_dump::{dddmp, dot};
-use oxidd_parser::load_file::load_file;
-use oxidd_parser::{ParseOptionsBuilder, Problem, Prop, Tree, VarSet};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use oxidd_parser::Literal;
+use oxidd_parser::{load_file, ParseOptionsBuilder};
 use rustc_hash::{FxHashMap, FxHasher};
 
 mod progress;
+mod scheduler;
 use progress::PROGRESS;
 mod profiler;
-use profiler::Profiler;
 mod util;
-use util::{handle_oom, HDuration};
+use util::HDuration;
 
 // spell-checker:ignore mref,funcs,dotfile,dmpfile
 
@@ -74,9 +73,14 @@ struct Cli {
     #[arg(long)]
     read_var_order: bool,
 
-    /// Order in which to apply operations when building a CNF
-    #[arg(value_enum, long, default_value_t = CNFBuildOrder::Balanced)]
-    cnf_build_order: CNFBuildOrder,
+    /// Read the CNF clause tree
+    #[arg(long)]
+    read_clause_tree: bool,
+
+    /// Order in which to apply operations when constructing a gate with more
+    /// than two inputs
+    #[arg(value_enum, long, default_value_t = GateBuildScheme::Balanced)]
+    gate_build_scheme: GateBuildScheme,
 
     /// For every DD operation of the problem(s), compute and print the size of
     /// the resulting DD function to the given CSV file
@@ -108,6 +112,10 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     threads: u32,
 
+    /// Always output durations as seconds (floating point)
+    #[arg(long)]
+    durations_as_secs: bool,
+
     /// Report progress
     #[arg(long, short = 'p')]
     progress: bool,
@@ -132,386 +140,213 @@ enum DDType {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
-enum CNFBuildOrder {
-    /// left-deep bracketing of the conjunctions in the input
-    /// order. Incompatible with --parallel.
+enum GateBuildScheme {
+    /// left-deep bracketing of the operands in the input order
     LeftDeep,
-    /// Approximately balanced bracketing of the conjunctions in the input order
+    /// approximately balanced bracketing of the operands in the input order
     Balanced,
-    /// Non-deterministic bracketing as a result of work stealing (using Rayon's
-    /// reduce method) but the order is kept as in the input. Requires
-    /// --parallel.
+    /// Non-deterministic bracketing as a result of work stealing, but the order
+    /// is kept as in the input. Requires --parallel.
     WorkStealing,
-    /// Bracketing tree and order from the comment lines in the input file
-    Tree,
 }
 
-impl CNFBuildOrder {
-    /// Whether an externally supplied clause order is necessary
-    fn needs_clause_order(self) -> bool {
-        self == CNFBuildOrder::Tree
-    }
+struct Inputs<'a> {
+    dddmp: Vec<(io::BufReader<fs::File>, dddmp::DumpHeader)>,
+    dddmp_paths: &'a [PathBuf],
+    /// root literal plus
+    problems: Vec<(oxidd_parser::Literal, oxidd_parser::Circuit)>,
+    problem_paths: &'a [PathBuf],
 }
 
-fn make_vars<'id, B: BooleanFunction>(
-    manager: &mut B::Manager<'id>,
-    var_set: &VarSet,
-    use_order: bool,
-    name_map: &mut FxHashMap<String, B>,
-) -> Vec<B>
-where
-    B::Manager<'id>: WorkerManager,
-    <B::Manager<'id> as Manager>::InnerNode: HasLevel,
-{
-    let num_vars = var_set.len();
-    if num_vars >= LevelNo::MAX as usize {
-        eprintln!("error: too many variables");
-        std::process::exit(1);
-    }
-
-    if use_order {
-        let Some(var_order) = var_set.order() else {
-            eprintln!("error: variable order not given");
-            std::process::exit(1);
-        };
-
-        let mut vars: Vec<Option<B>> = vec![None; var_order.len()];
-        let mut order = Vec::with_capacity(num_vars);
-        for &var in var_order {
-            let name = match var_set.name(var) {
-                Some(s) => s.to_string(),
-                None => var.to_string(),
+impl<'a> Inputs<'a> {
+    fn load(cli: &'a Cli) -> Self {
+        let dddmp = Vec::from_iter(cli.dddmp_import.iter().map(|path| {
+            let file = match fs::File::open(path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("\nerror: could not open '{}' ({e})", path.display());
+                    std::process::exit(1);
+                }
             };
-            let f = name_map
-                .entry(name)
-                .or_insert_with(|| handle_oom!(B::new_var(manager)))
-                .clone();
-            vars[var] = Some(f.clone());
-            order.push(f);
-        }
-        let vars: Vec<B> = vars
-            .into_iter()
-            .map(|x| x.expect("`var_order` must contain every variable id exactly once"))
-            .collect();
-        oxidd_reorder::set_var_order(manager, &order);
-        vars
-    } else {
-        (0..num_vars)
-            .map(|i| {
-                name_map
-                    .entry(i.to_string())
-                    .or_insert_with(|| handle_oom!(B::new_var(manager)))
-                    .clone()
-            })
-            .collect()
-    }
-}
+            let mut reader = io::BufReader::new(file);
 
-fn make_bool_dd<B>(
-    mref: &B::ManagerRef,
-    problem: Problem,
-    problem_no: usize,
-    cli: &Cli,
-    var_name_map: &mut FxHashMap<String, B>,
-) -> B
-where
-    B: BooleanFunction + Send + Sync + 'static,
-    for<'id> B::Manager<'id>: WorkerManager,
-    for<'id> <B::Manager<'id> as Manager>::InnerNode: HasLevel,
-{
-    fn prop_rec<B: BooleanFunction>(
-        manager: &B::Manager<'_>,
-        prop: &Prop,
-        vars: &[B],
-        profiler: &Profiler,
-    ) -> B {
-        let fold = |ps: &[Prop], init: B, op: fn(&B, &B) -> AllocResult<B>| {
-            ps.iter().fold(init, |acc, p| {
-                let rhs = prop_rec(manager, p, vars, profiler);
-                let op_start = profiler.start_op();
-                let res = handle_oom!(op(&acc, &rhs));
-                profiler.finish_op(op_start, &res);
-                res
-            })
-        };
+            let header = match dddmp::DumpHeader::load(&mut reader) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!(
+                        "\nerror: failed to load header of '{}' ({e})",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            };
+            (reader, header)
+        }));
 
-        match prop {
-            Prop::Lit(l) if l.positive() => vars[l.variable()].clone(),
-            Prop::Lit(l) => handle_oom!(vars[l.variable()].not()),
-            Prop::Neg(p) => handle_oom!(prop_rec(manager, p, vars, profiler).not()),
-            Prop::And(ps) => fold(ps, B::t(manager), B::and),
-            Prop::Or(ps) => fold(ps, B::f(manager), B::or),
-            Prop::Xor(ps) => fold(ps, B::f(manager), B::xor),
-            Prop::Eq(ps) => fold(ps, B::t(manager), B::and),
-        }
-    }
+        let parse_options = ParseOptionsBuilder::default()
+            .var_order(cli.read_var_order)
+            .clause_tree(cli.read_clause_tree)
+            .build()
+            .unwrap();
 
-    fn prop_inner_nodes(prop: &Prop) -> usize {
-        match prop {
-            Prop::Lit(_) => 0,
-            Prop::Neg(p) => 1 + prop_inner_nodes(p),
-            Prop::And(ps) | Prop::Or(ps) | Prop::Xor(ps) | Prop::Eq(ps) => {
-                ps.len() + ps.iter().map(prop_inner_nodes).sum::<usize>()
-            }
-        }
-    }
+        let problems = Vec::from_iter(cli.file.iter().map(|path| {
+            let Some(problem) = load_file(path, &parse_options) else {
+                std::process::exit(1)
+            };
 
-    fn balanced_reduce<T>(
-        iter: impl IntoIterator<Item = T>,
-        mut f: impl for<'a> FnMut(&'a T, &'a T) -> T,
-    ) -> Option<T> {
-        // We use `Option<T>` such that we can drop the values as soon as possible
-        let mut leaves: Vec<Option<T>> = iter.into_iter().map(Some).collect();
+            let simplified = problem.simplify().unwrap().0;
 
-        fn rec<T, F: for<'a> FnMut(&'a T, &'a T) -> T>(
-            leaves: &mut [Option<T>],
-            f: &mut F,
-        ) -> Option<T> {
-            match leaves {
-                [] => None,
-                [l] => l.take(),
-                _ => {
-                    let (l, r) = leaves.split_at_mut(leaves.len() / 2);
-                    let l = rec(l, f);
-                    let r = rec(r, f);
-                    match (l, r) {
-                        (None, v) | (v, None) => v,
-                        (Some(l), Some(r)) => Some(f(&l, &r)),
-                    }
+            match simplified.details {
+                oxidd_parser::ProblemDetails::Root(literal) => (literal, simplified.circuit),
+                oxidd_parser::ProblemDetails::AIGER(_) => {
+                    eprintln!("\nerror: AIGER inputs are not yet supported by oxidd-cli");
+                    std::process::exit(1);
                 }
             }
-        }
+        }));
 
-        rec(&mut leaves, &mut f)
-    }
-
-    fn balanced_reduce_par<T: Send>(
-        iter: impl IntoParallelIterator<Item = T>,
-        f: impl for<'a> Fn(&'a T, &'a T) -> T + Send + Copy,
-    ) -> Option<T> {
-        // We use `Option<T>` such that we can drop the values as soon as possible
-        let mut leaves: Vec<Option<T>> = iter.into_par_iter().map(Some).collect();
-
-        fn rec<T: Send>(
-            leaves: &mut [Option<T>],
-            f: impl for<'a> Fn(&'a T, &'a T) -> T + Send + Copy,
-        ) -> Option<T> {
-            match leaves {
-                [] => None,
-                [l] => l.take(),
-                _ => {
-                    let (l, r) = leaves.split_at_mut(leaves.len() / 2);
-                    match rayon::join(move || rec(l, f), move || rec(r, f)) {
-                        (None, v) | (v, None) => v,
-                        (Some(l), Some(r)) => Some(f(&l, &r)),
-                    }
-                }
-            }
-        }
-
-        rec(&mut leaves, f)
-    }
-
-    fn clause_tree_rec<B: BooleanFunction>(
-        clauses: &[B],
-        clause_order: &Tree<usize>,
-        profiler: &Profiler,
-    ) -> Option<B> {
-        match clause_order {
-            Tree::Leaf(n) => Some(clauses[*n].clone()),
-            Tree::Inner(sub) => balanced_reduce(
-                sub.iter()
-                    .filter_map(|t| clause_tree_rec(clauses, t, profiler)),
-                |lhs: &B, rhs: &B| {
-                    let op_start = profiler.start_op();
-                    let conj = handle_oom!(lhs.and(rhs));
-                    profiler.finish_op(op_start, &conj);
-                    conj
-                },
-            ),
+        Self {
+            dddmp,
+            dddmp_paths: &cli.dddmp_import,
+            problems,
+            problem_paths: &cli.file,
         }
     }
 
-    fn clause_tree_par_rec<B: BooleanFunction + Send + Sync>(
-        clauses: &[B],
-        clause_order: &Tree<usize>,
-        profiler: &Profiler,
-    ) -> Option<B> {
-        match clause_order {
-            Tree::Leaf(n) => Some(clauses[*n].clone()),
-            Tree::Inner(sub) => balanced_reduce_par(
-                sub.into_par_iter()
-                    .filter_map(|t| clause_tree_par_rec(clauses, t, profiler)),
-                |lhs: &B, rhs: &B| {
-                    let op_start = profiler.start_op();
-                    let conj = handle_oom!(lhs.and(rhs));
-                    profiler.finish_op(op_start, &conj);
-                    conj
-                },
-            ),
-        }
-    }
-
-    let profiler = Profiler::new(cli.size_profile.get(problem_no));
-
-    let func = match problem {
-        Problem::CNF(mut cnf) => {
-            if cli.cnf_build_order.needs_clause_order() && cnf.clause_order().is_none() {
-                eprintln!("error: clause order not given");
-                std::process::exit(1);
-            }
-
-            let vars = mref.with_manager_exclusive(|manager| {
-                make_vars::<B>(manager, cnf.vars(), cli.read_var_order, var_name_map)
-            });
-
-            mref.with_manager_shared(|manager| {
-                manager.set_split_depth(Some(0));
-                let clauses = cnf.clauses_mut();
-                PROGRESS.set_task(
-                    format!("build clauses (problem {problem_no})"),
-                    clauses.len(),
-                );
-                let mut bdd_clauses = Vec::with_capacity(clauses.len());
-                let mut i = 0;
-                while let Some(clause) = clauses.get_mut(i) {
-                    if clause.is_empty() {
-                        println!("clause {i} is empty");
-                        return B::f(manager);
-                    }
-
-                    // Build clause bottom-up
-                    clause.sort_unstable_by_key(|lit| std::cmp::Reverse(lit.variable()));
-                    let l = clause[0];
-                    let init = &vars[l.variable()];
-                    let init = if l.positive() {
-                        init.clone()
-                    } else {
-                        handle_oom!(init.not())
-                    };
-                    bdd_clauses.push(clause[1..].iter().fold(init, |acc, l| {
-                        let var = &vars[l.variable()];
-                        if l.positive() {
-                            handle_oom!(acc.or(var))
-                        } else {
-                            handle_oom!(acc.or(&handle_oom!(var.not())))
-                        }
-                    }));
-
-                    i += 1;
-                }
-                let clauses = bdd_clauses;
-                println!(
-                    "all {} clauses built after {}",
-                    clauses.len(),
-                    HDuration(profiler.elapsed_time())
-                );
-
-                manager.set_split_depth(cli.operation_split_depth);
-                PROGRESS.set_task(
-                    format!("conjoin clauses (problem {problem_no})"),
-                    clauses.len() - 1,
-                );
-                if clauses.is_empty() {
-                    B::t(manager)
-                } else {
-                    match (cli.cnf_build_order, cli.parallel) {
-                        (CNFBuildOrder::LeftDeep, false) => {
-                            let init = clauses[0].clone();
-                            clauses[1..].iter().fold(init, |acc, f| {
-                                let op_start = profiler.start_op();
-                                let res = handle_oom!(acc.and(f));
-                                profiler.finish_op(op_start, &res);
-                                res
-                            })
-                        }
-                        (CNFBuildOrder::LeftDeep, true) => unreachable!(),
-                        (CNFBuildOrder::Balanced, false) => {
-                            balanced_reduce(clauses, |lhs: &B, rhs: &B| {
-                                let op_start = profiler.start_op();
-                                let conj = handle_oom!(lhs.and(rhs));
-                                profiler.finish_op(op_start, &conj);
-                                conj
-                            })
-                            .unwrap()
-                        }
-                        (CNFBuildOrder::Balanced, true) => {
-                            balanced_reduce_par(clauses, |lhs: &B, rhs: &B| {
-                                let op_start = profiler.start_op();
-                                let conj = handle_oom!(lhs.and(rhs));
-                                profiler.finish_op(op_start, &conj);
-                                conj
-                            })
-                            .unwrap()
-                        }
-                        (CNFBuildOrder::WorkStealing, false) => unreachable!(),
-                        (CNFBuildOrder::WorkStealing, true) => ParallelIterator::reduce(
-                            clauses.into_par_iter().map(|c| Some(c)),
-                            || None,
-                            |lhs: Option<B>, rhs: Option<B>| match (lhs, rhs) {
-                                (None, v) | (v, None) => v,
-                                (Some(lhs), Some(rhs)) => {
-                                    let op_start = profiler.start_op();
-                                    let res = handle_oom!(lhs.and(&rhs));
-                                    profiler.finish_op(op_start, &res);
-                                    Some(res)
-                                }
-                            },
-                        )
-                        .unwrap(),
-                        (CNFBuildOrder::Tree, false) => {
-                            clause_tree_rec(&clauses, cnf.clause_order().unwrap(), &profiler)
-                                .unwrap()
-                        }
-                        (CNFBuildOrder::Tree, true) => {
-                            clause_tree_par_rec(&clauses, cnf.clause_order().unwrap(), &profiler)
-                                .unwrap()
-                        }
-                    }
-                }
-            })
-        }
-
-        Problem::Prop(prop) => {
-            PROGRESS.set_task(
-                "build propositional formula",
-                prop_inner_nodes(prop.formula()),
+    fn vars(&mut self) -> (VarNameMap, Vec<Vec<VarNo>>) {
+        #[cold]
+        fn too_many_vars(path: &Path) -> ! {
+            eprintln!(
+                "\nerror while loading {}: too many variables",
+                path.display()
             );
-            let vars = mref.with_manager_exclusive(|manager| {
-                make_vars::<B>(manager, prop.vars(), cli.read_var_order, var_name_map)
-            });
-            mref.with_manager_shared(|manager| {
-                manager.set_split_depth(cli.operation_split_depth);
-                prop_rec(manager, prop.formula(), &vars, &profiler)
-            })
+            std::process::exit(1);
+        }
+        #[inline]
+        fn check_too_many_vars(var_no: VarNo, path: &Path) {
+            if var_no == VarNo::MAX {
+                too_many_vars(path)
+            }
         }
 
-        _ => todo!(),
-    };
-    println!(
-        "BDD building done within {}",
-        HDuration(profiler.elapsed_time())
-    );
-    func
+        fn add<'a>(
+            var_name_map: &mut VarNameMap,
+            path: &Path,
+            num_vars: VarNo,
+            var_names: Option<impl IntoIterator<Item = &'a str>>,
+        ) -> Vec<VarNo> {
+            if var_name_map.is_empty() {
+                var_name_map.reserve(num_vars);
+
+                if let Some(var_names) = var_names {
+                    if let Err(err) = var_name_map.add_named(var_names) {
+                        eprintln!("\nerror while loading {}: {err}", path.display());
+                        std::process::exit(1);
+                    }
+                } else {
+                    var_name_map.add_unnamed(num_vars);
+                }
+                return Vec::new();
+            }
+
+            let Some(var_names) = var_names else {
+                if num_vars > var_name_map.len() {
+                    var_name_map.add_unnamed(num_vars - var_name_map.len());
+                }
+                return Vec::new();
+            };
+
+            let previously_defined = var_name_map.len();
+            let mut unnamed_search = 0;
+            let mut next_unnamed = |var_name_map: &mut VarNameMap| {
+                while unnamed_search != previously_defined {
+                    if var_name_map.var_name(unnamed_search).is_empty() {
+                        let id = unnamed_search;
+                        unnamed_search += 1;
+                        return id;
+                    }
+                    unnamed_search += 1;
+                }
+                let id = var_name_map.len();
+                check_too_many_vars(id, path);
+                var_name_map.add_unnamed(1);
+                id
+            };
+
+            let mut vars = Vec::with_capacity(num_vars as usize);
+            for name in var_names {
+                if name.is_empty() {
+                    vars.push(next_unnamed(var_name_map));
+                } else {
+                    let (id, found) = var_name_map.get_or_add(name);
+                    if !found {
+                        check_too_many_vars(id, path);
+                    } else if id >= previously_defined {
+                        eprintln!("\nerror while loading {}: the variable name '{name}' is used for two variables", path.display());
+                    }
+                }
+            }
+            vars
+        }
+
+        let mut var_name_map = VarNameMap::new();
+        // mappings from problem variable number to DD variable number
+        let mut var_maps = Vec::with_capacity(self.dddmp.len() + self.problems.len());
+
+        var_maps.extend(
+            self.dddmp
+                .iter()
+                .zip(self.dddmp_paths)
+                .map(|((_, header), path)| {
+                    add(
+                        &mut var_name_map,
+                        path,
+                        header.num_vars(),
+                        header
+                            .var_names()
+                            .map(|names| names.iter().map(String::as_str)),
+                    )
+                }),
+        );
+        var_maps.extend(self.problems.iter().zip(self.problem_paths).map(
+            |((_, circuit), path)| {
+                let inputs = circuit.inputs();
+                let Ok(num_inputs) = VarNo::try_from(inputs.len()) else {
+                    eprintln!(
+                        "\nerror while loading {}: the problem requires {} \
+                    variables, but OxiDD only supports up to {}",
+                        path.display(),
+                        inputs.len(),
+                        VarNo::MAX,
+                    );
+                    std::process::exit(1);
+                };
+
+                let var_names = if inputs.has_names() {
+                    Some((0..inputs.len()).map(|i| inputs.name(i).unwrap_or_default()))
+                } else {
+                    None
+                };
+                add(&mut var_name_map, path, num_inputs, var_names)
+            },
+        ));
+
+        (var_name_map, var_maps)
+    }
 }
 
 fn bool_dd_main<B, O>(cli: &Cli, mref: B::ManagerRef)
 where
     B: BooleanFunction + Send + Sync + 'static,
-    B::ManagerRef: Send + 'static,
-    for<'id> B: dot::DotStyle<<B::Manager<'id> as Manager>::EdgeTag>,
-    for<'id> B::Manager<'id>: WorkerManager + HasApplyCache<B::Manager<'id>, O>,
-    for<'id> <B::Manager<'id> as Manager>::InnerNode: HasLevel,
-    for<'id> <B::Manager<'id> as Manager>::EdgeTag: fmt::Debug,
-    for<'id> <B::Manager<'id> as Manager>::Terminal: FromStr + fmt::Display + dddmp::AsciiDisplay,
+    B::ManagerRef: HasWorkers + Send + 'static,
+    for<'id> B: dot::DotStyle<ETagOfFunc<'id, B>>,
+    for<'id> B::Manager<'id>: HasWorkers + HasApplyCache<B::Manager<'id>, O>,
+    for<'id> INodeOfFunc<'id, B>: HasLevel,
+    for<'id> ETagOfFunc<'id, B>: fmt::Debug,
+    for<'id> TermOfFunc<'id, B>:
+        oxidd_dump::ParseTagged<ETagOfFunc<'id, B>> + fmt::Display + oxidd_dump::AsciiDisplay,
     O: Copy + Ord + Hash,
 {
-    let parse_options = ParseOptionsBuilder::default()
-        .orders(cli.read_var_order || cli.cnf_build_order.needs_clause_order())
-        .build()
-        .unwrap();
-
-    let mut vars: FxHashMap<String, B> = Default::default();
     let mut funcs: Vec<(B, String)> = Vec::new();
 
     let progress_interval = match Duration::try_from_secs_f32(cli.progress_interval) {
@@ -531,8 +366,21 @@ where
         None
     };
 
-    let report_dd_node_count = || {
+    let mut inputs = Inputs::load(cli);
+    let (var_name_map, var_maps) = inputs.vars();
+    let var_count = var_name_map.len();
+
+    mref.with_manager_exclusive(|manager| manager.add_named_vars_from_map(var_name_map))
+        .unwrap();
+
+    let report_dd_node_count = |gc_count_before_construction: Option<u64>| {
         mref.with_manager_shared(|manager| {
+            if let Some(gc_count) = gc_count_before_construction {
+                println!(
+                    "garbage collections during construction: {}",
+                    manager.gc_count() - gc_count
+                );
+            }
             if !cli.no_prune_unreachable {
                 println!("node count before pruning: {}", manager.num_inner_nodes());
                 manager.apply_cache().clear(manager);
@@ -545,60 +393,37 @@ where
         })
     };
 
+    let mut var_maps: std::vec::IntoIter<Vec<VarNo>> = var_maps.into_iter();
+
     // Import dddmp files
-    if !cli.dddmp_import.is_empty() {
+    if !inputs.dddmp.is_empty() {
         PROGRESS.set_task("import from dddmp", cli.dddmp_import.len());
     }
-    for path in &cli.dddmp_import {
+    for ((path, (reader, header)), var_map) in inputs
+        .dddmp_paths
+        .iter()
+        .zip(inputs.dddmp)
+        .zip(var_maps.by_ref())
+    {
         PROGRESS.start_op();
         let start = Instant::now();
         print!("importing '{}' ...", path.display());
         io::stdout().flush().unwrap();
 
-        let file = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("\nerror: could not open '{}' ({e})", path.display());
-                std::process::exit(1);
-            }
-        };
-        let mut reader = io::BufReader::new(file);
-
-        let header = match dddmp::DumpHeader::load(&mut reader) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!(
-                    "\nerror: failed to load header of '{}' ({e})",
-                    path.display()
-                );
-                std::process::exit(1);
-            }
-        };
-
-        let mut support_vars = Vec::with_capacity(header.num_support_vars() as usize);
+        let var_map: &[VarNo] = &var_map[..]; // to help rust-analyzer
+        let support_vars = Vec::from_iter(
+            header
+                .support_var_order()
+                .iter()
+                .map(|&i| var_map.get(i as usize).copied().unwrap_or(i)),
+        );
         mref.with_manager_exclusive(|manager| {
-            if let Some(var_names) = header.ordered_var_names() {
-                let mut filter = bitvec![0; header.num_vars() as usize];
-                for &i in header.support_var_permutation() {
-                    filter.set(i as usize, true);
-                }
-                for (name, in_support) in var_names.iter().zip(filter) {
-                    let f = vars
-                        .entry(name.clone())
-                        .or_insert_with(|| handle_oom!(B::new_var(manager)));
-                    if in_support {
-                        support_vars.push(f.clone());
-                    }
-                }
-            } else {
-                todo!()
-            }
-
             oxidd_reorder::set_var_order(manager, &support_vars);
         });
 
         mref.with_manager_shared(|manager| {
-            match dddmp::import(reader, &header, manager, &support_vars, B::not_edge_owned) {
+            let support_vars = support_vars.iter().copied();
+            match dddmp::import(reader, &header, manager, support_vars, B::not_edge_owned) {
                 Ok(roots) => {
                     let name_prefix = match header.diagram_name() {
                         Some(n) => Cow::Borrowed(n),
@@ -625,23 +450,63 @@ where
         PROGRESS.finish_op();
         println!(" done ({})", HDuration(start.elapsed()));
 
-        report_dd_node_count();
+        report_dd_node_count(None);
     }
 
     // Construct DDs for input problems (e.g., from DIMACS files)
-    for (i, file) in cli.file.iter().enumerate() {
-        let start = Instant::now();
-        let Some(problem) = load_file(file, &parse_options) else {
-            std::process::exit(1)
-        };
-        println!("parsing done within {}", HDuration(start.elapsed()));
+    for (problem_no, ((path, (mut root, mut circuit)), var_map)) in inputs
+        .problem_paths
+        .iter()
+        .zip(inputs.problems)
+        .zip(var_maps)
+        .enumerate()
+    {
+        PROGRESS.set_problem_no(problem_no);
+        let file_name = path.file_name().unwrap().to_string_lossy();
 
-        funcs.push((
-            make_bool_dd(&mref, problem, i, cli, &mut vars),
-            file.file_name().unwrap().to_string_lossy().to_string(),
-        ));
+        if let Some(order) = circuit.inputs().order() {
+            let start = Instant::now();
+            let var_map: &[VarNo] = &var_map[..]; // to help rust-analyzer
+            let order = Vec::from_iter(
+                order
+                    .iter()
+                    .map(|&i| var_map.get(i).copied().unwrap_or(i as VarNo)),
+            );
+            mref.with_manager_exclusive(|manager| {
+                oxidd_reorder::set_var_order(manager, &order);
+            });
+            println!("reordering took {}", HDuration(start.elapsed()));
+        }
 
-        report_dd_node_count();
+        if !var_map.is_empty() {
+            for gate_no in 0..circuit.num_gates() {
+                for l in circuit.gate_inputs_mut_for_no(gate_no).unwrap() {
+                    if let Some(var) = l.get_input() {
+                        *l = Literal::from_input(l.is_negative(), var_map[var] as usize);
+                    }
+                }
+            }
+            if let Some(var) = root.get_input() {
+                root = Literal::from_input(root.is_negative(), var_map[var] as usize);
+            }
+        }
+        drop(var_map);
+
+        let gc_count = mref.with_manager_shared(|manager| manager.gc_count());
+
+        let mut result = [None];
+        scheduler::construct_bool_circuit(
+            &mref,
+            circuit,
+            cli,
+            &[root],
+            &mut result,
+            cli.size_profile.get(problem_no),
+        );
+        let [result] = result;
+        funcs.push((result.unwrap(), file_name.to_string()));
+
+        report_dd_node_count(Some(gc_count));
     }
 
     let pause_handle = PROGRESS.pause_progress_report();
@@ -674,7 +539,7 @@ where
             print!("  model count: ");
             io::stdout().flush().unwrap();
             let start = Instant::now();
-            let count = f.sat_count(vars.len() as LevelNo, &mut model_count_cache);
+            let count = f.sat_count(var_count, &mut model_count_cache);
             println!("{count} ({})", HDuration(start.elapsed()));
         }
     }
@@ -689,7 +554,6 @@ where
                     dot::dump_all(
                         std::io::BufWriter::new(file),
                         manager,
-                        vars.iter().map(|(n, f)| (f, n.as_str())),
                         funcs.iter().map(|(f, n)| (f, n.as_str())),
                     )
                 })
@@ -702,30 +566,19 @@ where
             PROGRESS.set_task("dddmp export", 1);
             fs::File::create(dmpfile)
                 .and_then(|file| {
-                    let mut var_edges = Vec::with_capacity(vars.len());
-                    let mut var_names = Vec::with_capacity(vars.len());
-                    for (name, var) in vars.iter() {
-                        var_edges.push(var);
-                        var_names.push(name.as_str());
-                    }
-                    let functions: Vec<_> = funcs.iter().map(|(f, _)| f).collect();
-                    let function_names: Vec<&str> = funcs.iter().map(|(_, n)| n.as_str()).collect();
-
                     let mut writer = std::io::BufWriter::new(file);
                     let start = Instant::now();
-                    dddmp::export(
+                    let mut export = dddmp::ExportSettings::default();
+                    if cli.dddmp_ascii {
+                        export = export.ascii();
+                    }
+                    export.export_with_names(
                         &mut writer,
                         manager,
-                        cli.dddmp_ascii,
-                        "",
-                        &var_edges,
-                        Some(&var_names),
-                        &functions,
-                        Some(&function_names),
-                        |e| e.tag() != Default::default(),
+                        funcs.iter().map(|(a, b)| (a, b)),
                     )?;
                     println!(
-                        "exported BDD ({} bytes) in {}",
+                        "exported decision diagram ({} bytes) in {}",
                         writer.stream_position().unwrap_or_default(),
                         HDuration(start.elapsed())
                     );
@@ -745,17 +598,11 @@ where
 
 fn main() {
     let cli = Cli::parse();
+    util::DURATIONS_AS_SECS.store(cli.durations_as_secs, std::sync::atomic::Ordering::Relaxed);
 
-    match (cli.cnf_build_order, cli.parallel) {
-        (CNFBuildOrder::LeftDeep, true) => {
-            eprintln!("--cnf-build-order=left-deep and --parallel are incompatible");
-            std::process::exit(1);
-        }
-        (CNFBuildOrder::WorkStealing, false) => {
-            eprintln!("--cnf-build-order=work-stealing requires --parallel");
-            std::process::exit(1);
-        }
-        _ => {}
+    if let (GateBuildScheme::WorkStealing, false) = (cli.gate_build_scheme, cli.parallel) {
+        eprintln!("--gate-build-order=work-stealing requires --parallel");
+        std::process::exit(1);
     }
 
     let mut inner_node_capacity = cli.inner_node_capacity;
@@ -785,7 +632,11 @@ fn main() {
         DDType::BDD => {
             let mref =
                 oxidd::bdd::new_manager(inner_node_capacity, cli.apply_cache_capacity, cli.threads);
-            bool_dd_main::<oxidd::bdd::BDDFunction, _>(&cli, mref);
+            // Run all operations from within the worker pool to reduce the number of
+            // context switches
+            mref.clone()
+                .workers()
+                .install(move || bool_dd_main::<oxidd::bdd::BDDFunction, _>(&cli, mref))
         }
         DDType::BCDD => {
             let mref = oxidd::bcdd::new_manager(
@@ -793,8 +644,19 @@ fn main() {
                 cli.apply_cache_capacity,
                 cli.threads,
             );
-            bool_dd_main::<oxidd::bcdd::BCDDFunction, _>(&cli, mref);
+            mref.clone()
+                .workers()
+                .install(move || bool_dd_main::<oxidd::bcdd::BCDDFunction, _>(&cli, mref))
         }
-        DDType::ZBDD => todo!(),
+        DDType::ZBDD => {
+            let mref = oxidd::zbdd::new_manager(
+                inner_node_capacity,
+                cli.apply_cache_capacity,
+                cli.threads,
+            );
+            mref.clone()
+                .workers()
+                .install(move || bool_dd_main::<oxidd::zbdd::ZBDDFunction, _>(&cli, mref))
+        }
     }
 }

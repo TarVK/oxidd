@@ -17,8 +17,8 @@ pub struct StaticTerminalManager<'id, T, N, ET, const TERMINALS: usize>(
     PhantomData<(&'id (), T, N, ET)>,
 );
 
-impl<'id, T: Countable, N, ET: Tag, const TERMINALS: usize>
-    StaticTerminalManager<'id, T, N, ET, TERMINALS>
+impl<T: Countable, N, ET: Tag, const TERMINALS: usize>
+    StaticTerminalManager<'_, T, N, ET, TERMINALS>
 {
     const CHECK_TERMINALS: () = assert!(TERMINALS > T::MAX_VALUE);
 }
@@ -32,14 +32,19 @@ where
     EdgeTag: Tag,
 {
     type TerminalNode = Terminal;
-    type TerminalNodeRef<'a> = Terminal where Self: 'a;
-
-    type Iterator<'a> = StaticTerminalIterator<'id, InnerNode, EdgeTag>
+    type TerminalNodeRef<'a>
+        = Terminal
     where
-        Self: 'a, 'id: 'a;
+        Self: 'a;
+
+    type Iterator<'a>
+        = StaticTerminalIterator<'id, InnerNode, EdgeTag>
+    where
+        Self: 'a,
+        'id: 'a;
 
     fn with_capacity(_capacity: u32) -> Self {
-        let _ = Self::CHECK_TERMINALS;
+        let () = Self::CHECK_TERMINALS;
         Self(PhantomData)
     }
 
@@ -65,7 +70,7 @@ where
 
     #[inline]
     fn get_edge(&self, terminal: Terminal) -> AllocResult<Edge<'id, InnerNode, EdgeTag>> {
-        let _ = Self::CHECK_TERMINALS;
+        let () = Self::CHECK_TERMINALS;
         // SAFETY: `terminal.as_usize() <= Terminal::MAX_VALUE` is guaranteed
         // and we checked `TERMINALS > Terminal::MAX_VALUE`. There are no
         // reference counters to update.
@@ -105,7 +110,7 @@ pub struct StaticTerminalIterator<'id, InnerNode, EdgeTag> {
     phantom: PhantomData<Edge<'id, InnerNode, EdgeTag>>,
 }
 
-impl<'id, InnerNode, EdgeTag> StaticTerminalIterator<'id, InnerNode, EdgeTag> {
+impl<InnerNode, EdgeTag> StaticTerminalIterator<'_, InnerNode, EdgeTag> {
     #[inline(always)]
     pub fn new(count: u32) -> Self {
         Self {
@@ -142,13 +147,13 @@ impl<'id, InnerNode: NodeBase, EdgeTag: Tag> Iterator
     }
 }
 
-impl<'id, InnerNode: NodeBase, EdgeTag: Tag> FusedIterator
-    for StaticTerminalIterator<'id, InnerNode, EdgeTag>
+impl<InnerNode: NodeBase, EdgeTag: Tag> FusedIterator
+    for StaticTerminalIterator<'_, InnerNode, EdgeTag>
 {
 }
 
-impl<'id, InnerNode: NodeBase, EdgeTag: Tag> ExactSizeIterator
-    for StaticTerminalIterator<'id, InnerNode, EdgeTag>
+impl<InnerNode: NodeBase, EdgeTag: Tag> ExactSizeIterator
+    for StaticTerminalIterator<'_, InnerNode, EdgeTag>
 {
     #[inline(always)]
     fn len(&self) -> usize {

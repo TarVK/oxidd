@@ -1,16 +1,16 @@
 [package]
 name = "oxidd"
-version = "0.7.0"
+version = "0.11.0"
 edition = "2021"
 description = "A safe, concurrent, modular, and performant decision diagram framework."
 readme = "../../README.md"
 keywords = ["decision-diagrams", "bdd", "zbdd", "zdd"]
 categories = ["data-structures", "mathematics", "science"]
 
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 
 [dependencies]
@@ -26,12 +26,19 @@ oxidd-rules-mtbdd = { workspace = true, optional = true }
 oxidd-rules-tdd = { workspace = true, optional = true }
 oxidd-rules-zbdd = { workspace = true, optional = true }
 
-rustc-hash = "2" # fast hash function
+# fast hash function
+#
+# Note that there is a performance regression with 2.0, see
+# https://github.com/rust-lang/rustc-hash/issues/45
+rustc-hash = "1.1"
 
 cfg-if = "1.0"
 
 # document feature flags
 document-features = "0.2"
+
+# standard derive macros but with custom bounds on generics
+derive-where = "1.5"
 
 
 [features]
@@ -43,6 +50,9 @@ default = [
   "zbdd",
   "multi-threading",
   "apply-cache-direct-mapped",
+  "dddmp",
+  "dot-export",
+  "visualize",
 ]
 
 ## Enable the simple BDD implementation
@@ -95,14 +105,24 @@ statistics = [
   "oxidd-manager-index?/statistics",
 ]
 
+## DDDMP export
+dddmp = ["oxidd-dump/dddmp"]
+
+## Visualization using Graphviz DOT
+dot-export = ["oxidd-dump/dot"]
+
+## Visualization using OxiDD-vis
+visualize = ["oxidd-dump/visualize"]
+
+
 [[example]]
 name = "tdd"
-required-features = ["tdd"]
+required-features = ["tdd", "dot-export"]
 
 [[example]]
 name = "mtbdd"
-required-features = ["mtbdd"]
+required-features = ["mtbdd", "dot-export", "visualize"]
 
 [[example]]
 name = "zbdd"
-required-features = ["zbdd"]
+required-features = ["zbdd", "dot-export"]

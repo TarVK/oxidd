@@ -4,28 +4,19 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-// We use const assertions for checking configurations and need to make sure
-// that they are evaluated
-#![allow(clippy::let_unit_value)]
 
 use std::alloc;
-use std::hash::Hash;
-use std::hash::Hasher;
-use std::marker::PhantomData;
-use std::marker::PhantomPinned;
-use std::mem::size_of;
-use std::mem::ManuallyDrop;
-use std::mem::MaybeUninit;
+use std::marker::{PhantomData, PhantomPinned};
+use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::ops::Deref;
 use std::ptr;
-use std::ptr::addr_of;
-use std::ptr::addr_of_mut;
-use std::ptr::NonNull;
+use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::sync::atomic;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 use crossbeam_utils::CachePadded;
+use derive_where::derive_where;
 use parking_lot::Mutex;
 
 /// Atomically reference counted value
@@ -216,7 +207,7 @@ impl<I, D, const PAGE_SIZE: usize> ArcSlab<I, D, PAGE_SIZE> {
     /// tagged as the root of the allocation.
     pub unsafe fn new_with(init_data: impl FnOnce(*mut D)) -> ArcSlabRef<I, D, PAGE_SIZE> {
         // Ensure that our assertion is evaluated
-        let _ = Self::ASSERT_PAGE_SIZE_POWER_OF_TWO;
+        let () = Self::ASSERT_PAGE_SIZE_POWER_OF_TWO;
 
         // Use a `Box` here such that we do not have to implement the allocation
         // ourselves. Inspired by the `Arc` implementation in the Rustonomicon.
@@ -479,7 +470,7 @@ impl<I, D, const PAGE_SIZE: usize> Page<I, D, PAGE_SIZE> {
         } / size_of::<Slot<I>>() as isize;
         let mut slot = first_slot;
         let last_slot = unsafe { slot.offset(count - 1) };
-        while slot != last_slot {
+        while !std::ptr::eq(slot, last_slot) {
             let next = unsafe { slot.offset(1) };
             unsafe { ptr::write(addr_of_mut!((*slot).next_free), next) };
             slot = next;
@@ -635,6 +626,7 @@ impl<I: AtomicRefCounted> Slot<I> {
 /// [`ExtHandle`]s are dropped, and we do not want to store `Arc`s along with
 /// the `ExtHandle`s. This is the reason for this custom reference type.
 #[repr(transparent)]
+#[derive_where(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ArcSlabRef<I, D, const PAGE_SIZE: usize>(NonNull<ArcSlab<I, D, PAGE_SIZE>>);
 
 impl<I, D, const PAGE_SIZE: usize> ArcSlabRef<I, D, PAGE_SIZE> {
@@ -693,31 +685,6 @@ impl<I, D, const PAGE_SIZE: usize> Drop for ArcSlabRef<I, D, PAGE_SIZE> {
     }
 }
 
-impl<I, D, const PAGE_SIZE: usize> PartialEq for ArcSlabRef<I, D, PAGE_SIZE> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl<I, D, const PAGE_SIZE: usize> Eq for ArcSlabRef<I, D, PAGE_SIZE> {}
-
-impl<I, D, const PAGE_SIZE: usize> Hash for ArcSlabRef<I, D, PAGE_SIZE> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl<I, D, const PAGE_SIZE: usize> PartialOrd for ArcSlabRef<I, D, PAGE_SIZE> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.0.cmp(&other.0))
-    }
-}
-
-impl<I, D, const PAGE_SIZE: usize> Ord for ArcSlabRef<I, D, PAGE_SIZE> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
 // SAFETY: It is safe to send `ArcSlabRef`s to another thread.
 unsafe impl<I: Send + Sync, D: Send + Sync, const PAGE_SIZE: usize> Send
     for ArcSlabRef<I, D, PAGE_SIZE>
@@ -740,12 +707,13 @@ unsafe impl<I: Send + Sync, D: Send + Sync, const PAGE_SIZE: usize> Sync
 //
 // SAFETY invariant: The `ArcSlab` outlives `'a`
 #[repr(transparent)]
+#[derive_where(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IntHandle<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize>(
     NonNull<Slot<I>>,
-    PhantomData<(D, &'a ())>,
+    #[derive_where(skip)] PhantomData<(D, &'a ())>,
 );
 
-impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> IntHandle<'a, I, D, PAGE_SIZE> {
+impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> IntHandle<'_, I, D, PAGE_SIZE> {
     /// Move the referenced item out in case `this` is the last reference,
     /// otherwise return `None`
     #[inline]
@@ -753,6 +721,31 @@ impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> IntHandle<'a, I, D, PAG
         let slot = this.0;
         std::mem::forget(this); // "first things first" for exception safety
         unsafe { Slot::release_move::<D, PAGE_SIZE>(slot) }
+    }
+
+    /// Move the referenced item out without checking whether `this` is the last
+    /// reference
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `this` is the last reference. Beware of
+    /// relaxed memory (e.g., use [`Acquire`] ordering to check that `this` is
+    /// the last reference).
+    #[inline]
+    pub unsafe fn force_into_inner(this: Self) -> I {
+        let mut slot = this.0;
+        std::mem::forget(this);
+
+        // SAFETY: We have (exclusive) access to the non-empty slot
+        debug_assert_eq!(unsafe { &slot.as_ref().item }.current(), 1);
+
+        // SAFETY: We have exclusive access to the slot, we don't use the item
+        // again
+        let res = unsafe { ManuallyDrop::take(&mut slot.as_mut().item) };
+        // SAFETY: The slot is empty
+        unsafe { Page::<I, D, PAGE_SIZE>::free_slot(slot) };
+
+        res
     }
 
     /// Drop this handle with a "custom drop implementation" `f` for the item
@@ -793,7 +786,7 @@ impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> IntHandle<'a, I, D, PAG
     }
 }
 
-impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> Clone for IntHandle<'a, I, D, PAGE_SIZE> {
+impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> Clone for IntHandle<'_, I, D, PAGE_SIZE> {
     #[inline]
     fn clone(&self) -> Self {
         unsafe { Slot::retain(self.0) };
@@ -801,14 +794,14 @@ impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> Clone for IntHandle<'a,
     }
 }
 
-impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> Drop for IntHandle<'a, I, D, PAGE_SIZE> {
+impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> Drop for IntHandle<'_, I, D, PAGE_SIZE> {
     #[inline]
     fn drop(&mut self) {
         unsafe { Slot::release::<D, PAGE_SIZE>(self.0, |_| {}) };
     }
 }
 
-impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> Deref for IntHandle<'a, I, D, PAGE_SIZE> {
+impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> Deref for IntHandle<'_, I, D, PAGE_SIZE> {
     type Target = I;
 
     #[inline]
@@ -818,43 +811,12 @@ impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> Deref for IntHandle<'a,
     }
 }
 
-impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> PartialEq
-    for IntHandle<'a, I, D, PAGE_SIZE>
-{
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> Eq for IntHandle<'a, I, D, PAGE_SIZE> {}
-
-impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> PartialOrd
-    for IntHandle<'a, I, D, PAGE_SIZE>
-{
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.0.cmp(&other.0))
-    }
-}
-impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> Ord for IntHandle<'a, I, D, PAGE_SIZE> {
-    #[inline]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl<'a, I: AtomicRefCounted, D, const PAGE_SIZE: usize> Hash for IntHandle<'a, I, D, PAGE_SIZE> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-unsafe impl<'a, I: AtomicRefCounted + Send + Sync, D: Send + Sync, const PAGE_SIZE: usize> Send
-    for IntHandle<'a, I, D, PAGE_SIZE>
+unsafe impl<I: AtomicRefCounted + Send + Sync, D: Send + Sync, const PAGE_SIZE: usize> Send
+    for IntHandle<'_, I, D, PAGE_SIZE>
 {
 }
-unsafe impl<'a, I: AtomicRefCounted + Send + Sync, D: Send + Sync, const PAGE_SIZE: usize> Sync
-    for IntHandle<'a, I, D, PAGE_SIZE>
+unsafe impl<I: AtomicRefCounted + Send + Sync, D: Send + Sync, const PAGE_SIZE: usize> Sync
+    for IntHandle<'_, I, D, PAGE_SIZE>
 {
 }
 
@@ -866,9 +828,10 @@ unsafe impl<'a, I: AtomicRefCounted + Send + Sync, D: Send + Sync, const PAGE_SI
 /// reference counter of the [`ArcSlab`]. Therefore, we can always obtain an
 /// `&ArcSlab`.
 #[repr(transparent)]
+#[derive_where(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExtHandle<I: AtomicRefCounted, D, const PAGE_SIZE: usize>(
     NonNull<Slot<I>>,
-    PhantomData<D>,
+    #[derive_where(skip)] PhantomData<D>,
 );
 
 impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> ExtHandle<I, D, PAGE_SIZE> {
@@ -975,33 +938,6 @@ impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> Deref for ExtHandle<I, D, P
     fn deref(&self) -> &I {
         // SAFETY: the slot is occupied
         unsafe { &self.0.as_ref().item }
-    }
-}
-
-impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> PartialEq for ExtHandle<I, D, PAGE_SIZE> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> Eq for ExtHandle<I, D, PAGE_SIZE> {}
-
-impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> PartialOrd for ExtHandle<I, D, PAGE_SIZE> {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.0.cmp(&other.0))
-    }
-}
-impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> Ord for ExtHandle<I, D, PAGE_SIZE> {
-    #[inline]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl<I: AtomicRefCounted, D, const PAGE_SIZE: usize> Hash for ExtHandle<I, D, PAGE_SIZE> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
     }
 }
 

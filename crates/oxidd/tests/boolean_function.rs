@@ -13,10 +13,9 @@ use oxidd::bcdd::BCDDFunction;
 use oxidd::bdd::BDDFunction;
 use oxidd::util::OptBool;
 use oxidd::zbdd::ZBDDFunction;
-use oxidd::zbdd::ZBDDManagerRef;
 use oxidd::{
     BooleanFunction, BooleanFunctionQuant, BooleanOperator, BooleanVecSet, Function, FunctionSubst,
-    InnerNode, Manager, ManagerRef, WorkerManager,
+    HasWorkers, InnerNode, Manager, ManagerRef, VarNo, WorkerPool,
 };
 
 use boolean_prop::Prop;
@@ -29,9 +28,10 @@ fn bdd_node_count() {
     let mref = oxidd::bdd::new_manager(1024, 128, 2);
 
     let (x0, x1, ff, tt) = mref.with_manager_exclusive(|manager| {
+        manager.add_named_vars(["x0", "x1"]).unwrap();
         (
-            BDDFunction::new_var(manager).unwrap(),
-            BDDFunction::new_var(manager).unwrap(),
+            BDDFunction::var(manager, 0).unwrap(),
+            BDDFunction::var(manager, 1).unwrap(),
             BDDFunction::f(manager),
             BDDFunction::t(manager),
         )
@@ -52,9 +52,10 @@ fn bcdd_node_count() {
     let mref = oxidd::bcdd::new_manager(1024, 128, 2);
 
     let (x0, x1, ff, tt) = mref.with_manager_exclusive(|manager| {
+        manager.add_named_vars(["x0", "x1"]).unwrap();
         (
-            BCDDFunction::new_var(manager).unwrap(),
-            BCDDFunction::new_var(manager).unwrap(),
+            BCDDFunction::var(manager, 0).unwrap(),
+            BCDDFunction::var(manager, 1).unwrap(),
             BCDDFunction::f(manager),
             BCDDFunction::t(manager),
         )
@@ -76,9 +77,10 @@ fn zbdd_node_count() {
     let mref = oxidd::zbdd::new_manager(1024, 128, 2);
 
     let (x0, x1, ee, bb) = mref.with_manager_exclusive(|manager| {
+        manager.add_named_vars(["x0", "x1"]).unwrap();
         (
-            ZBDDFunction::new_singleton(manager).unwrap(),
-            ZBDDFunction::new_singleton(manager).unwrap(),
+            ZBDDFunction::singleton(manager, 0).unwrap(),
+            ZBDDFunction::singleton(manager, 1).unwrap(),
             ZBDDFunction::empty(manager),
             ZBDDFunction::base(manager),
         )
@@ -99,9 +101,10 @@ fn bdd_cofactors() {
     let mref = oxidd::bdd::new_manager(1024, 128, 2);
 
     let (x0, x1, ff, tt) = mref.with_manager_exclusive(|manager| {
+        manager.add_named_vars(["x0", "x1"]).unwrap();
         (
-            BDDFunction::new_var(manager).unwrap(),
-            BDDFunction::new_var(manager).unwrap(),
+            BDDFunction::var(manager, 0).unwrap(),
+            BDDFunction::var(manager, 1).unwrap(),
             BDDFunction::f(manager),
             BDDFunction::t(manager),
         )
@@ -138,9 +141,10 @@ fn bcdd_cofactors() {
     let mref = oxidd::bcdd::new_manager(1024, 128, 2);
 
     let (x0, x1, ff, tt) = mref.with_manager_exclusive(|manager| {
+        manager.add_named_vars(["x0", "x1"]).unwrap();
         (
-            BCDDFunction::new_var(manager).unwrap(),
-            BCDDFunction::new_var(manager).unwrap(),
+            BCDDFunction::var(manager, 0).unwrap(),
+            BCDDFunction::var(manager, 1).unwrap(),
             BCDDFunction::f(manager),
             BCDDFunction::t(manager),
         )
@@ -175,9 +179,10 @@ fn zbdd_cofactors() {
     let mref = oxidd::zbdd::new_manager(1024, 128, 2);
 
     let (x0, x1, ee, bb) = mref.with_manager_exclusive(|manager| {
+        manager.add_named_vars(["x0", "x1"]).unwrap();
         (
-            ZBDDFunction::new_singleton(manager).unwrap(),
-            ZBDDFunction::new_singleton(manager).unwrap(),
+            ZBDDFunction::singleton(manager, 0).unwrap(),
+            ZBDDFunction::singleton(manager, 1).unwrap(),
             ZBDDFunction::empty(manager),
             ZBDDFunction::base(manager),
         )
@@ -211,18 +216,16 @@ fn test_simple_formulas<B: BooleanFunction>(manager: &B::ManagerRef) {
     use Prop::*;
 
     for op1 in [false, true] {
-        Prop::from(op1)
-            .build_and_check::<B>(manager, &[], &[])
-            .unwrap();
+        Prop::from(op1).build_and_check::<B>(manager, &[]).unwrap();
 
         Not(Box::new(op1.into()))
-            .build_and_check::<B>(manager, &[], &[])
+            .build_and_check::<B>(manager, &[])
             .unwrap();
 
         for op2 in [false, true] {
             for binop in [And, Or, Xor, Equiv, Nand, Nor, Imp, ImpStrict] {
                 binop(Box::new(op1.into()), Box::new(op2.into()))
-                    .build_and_check::<B>(manager, &[], &[])
+                    .build_and_check::<B>(manager, &[])
                     .unwrap();
             }
 
@@ -232,7 +235,7 @@ fn test_simple_formulas<B: BooleanFunction>(manager: &B::ManagerRef) {
                     Box::new(op2.into()),
                     Box::new(op3.into()),
                 )
-                .build_and_check::<B>(manager, &[], &[])
+                .build_and_check::<B>(manager, &[])
                 .unwrap();
             }
         }
@@ -275,35 +278,17 @@ fn zbdd_simple_formulas_t2() {
     test_simple_formulas::<ZBDDFunction>(&mref);
 }
 
-/// Works for BDDs & BCDDs
-fn bdd_vars<B: BooleanFunction>(mref: &B::ManagerRef, n: usize) -> Vec<B> {
-    mref.with_manager_exclusive(|manager| (0..n).map(|_| B::new_var(manager).unwrap()).collect())
-}
-
-fn zbdd_singletons_vars(mref: &ZBDDManagerRef, n: usize) -> (Vec<ZBDDFunction>, Vec<ZBDDFunction>) {
-    let singletons: Vec<ZBDDFunction> = mref.with_manager_exclusive(|manager| {
-        (0..n)
-            .map(|_| ZBDDFunction::new_singleton(manager).unwrap())
-            .collect()
-    });
-    let vars = mref.with_manager_shared(|manager| {
-        singletons
-            .iter()
-            .map(|s| {
-                ZBDDFunction::from_edge(
-                    manager,
-                    oxidd::zbdd::var_boolean_function(manager, s.as_edge(manager)).unwrap(),
-                )
-            })
-            .collect()
-    });
-    (singletons, vars)
+fn make_vars<B: BooleanFunction>(mref: &B::ManagerRef, n: VarNo) -> Vec<B> {
+    mref.with_manager_exclusive(|manager| {
+        manager.add_vars(n);
+        (0..n).map(|i| B::var(manager, i).unwrap()).collect()
+    })
 }
 
 #[test]
 fn bcdd_restrict() {
     let mref = oxidd::bcdd::new_manager(1024, 1024, 2);
-    let vars = bdd_vars::<BCDDFunction>(&mref, 3);
+    let vars = make_vars::<BCDDFunction>(&mref, 3);
     use Prop::*;
     let formulas = [
         Restrict(
@@ -321,17 +306,16 @@ fn bcdd_restrict() {
         ),
     ];
     for formula in formulas {
-        formula.build_and_check_quant(&mref, &vars, &vars).unwrap();
+        formula.build_and_check_quant(&mref, &vars).unwrap();
     }
 }
 
-fn test_prop_depth2<B: BooleanFunction>(manager: &B::ManagerRef, vars: &[B], var_handles: &[B]) {
-    assert_eq!(vars.len(), var_handles.len());
+fn test_prop_depth2<B: BooleanFunction>(manager: &B::ManagerRef, vars: &[B]) {
     assert!(vars.len() < 32);
     let mut f = Prop::False;
     let mut progress = Progress::new(38_493_515);
     loop {
-        f.build_and_check(manager, vars, var_handles).unwrap();
+        f.build_and_check(manager, vars).unwrap();
         progress.step();
 
         if !f.next::<false>(2, vars.len() as u32) {
@@ -341,17 +325,12 @@ fn test_prop_depth2<B: BooleanFunction>(manager: &B::ManagerRef, vars: &[B], var
     progress.done();
 }
 
-fn test_prop_depth2_quant<B: BooleanFunctionQuant>(
-    manager: &B::ManagerRef,
-    vars: &[B],
-    var_handles: &[B],
-) {
-    assert_eq!(vars.len(), var_handles.len());
+fn test_prop_depth2_quant<B: BooleanFunctionQuant>(manager: &B::ManagerRef, vars: &[B]) {
     assert!(vars.len() < 32);
     let mut f = Prop::False;
     let mut progress = Progress::new(208_194_485);
     loop {
-        f.build_and_check_quant(manager, vars, var_handles).unwrap();
+        f.build_and_check_quant(manager, vars).unwrap();
         progress.step();
 
         if !f.next::<true>(2, vars.len() as u32) {
@@ -370,48 +349,48 @@ fn test_prop_depth2_quant<B: BooleanFunctionQuant>(
 #[ignore]
 fn bdd_prop_depth2_3vars_t1() {
     let mref = oxidd::bdd::new_manager(65536, 1024, 1);
-    let vars = bdd_vars::<BDDFunction>(&mref, 3);
-    test_prop_depth2_quant(&mref, &vars, &vars);
+    let vars = make_vars::<BDDFunction>(&mref, 3);
+    test_prop_depth2_quant(&mref, &vars);
 }
 
 #[test]
 #[ignore]
 fn bdd_prop_depth2_3vars_t2() {
     let mref = oxidd::bdd::new_manager(65536, 1024, 2);
-    let vars = bdd_vars::<BDDFunction>(&mref, 3);
-    test_prop_depth2_quant(&mref, &vars, &vars);
+    let vars = make_vars::<BDDFunction>(&mref, 3);
+    test_prop_depth2_quant(&mref, &vars);
 }
 
 #[test]
 #[ignore]
 fn bcdd_prop_depth2_3vars_t1() {
     let mref = oxidd::bcdd::new_manager(65536, 1024, 1);
-    let vars = bdd_vars::<BCDDFunction>(&mref, 3);
-    test_prop_depth2_quant(&mref, &vars, &vars);
+    let vars = make_vars::<BCDDFunction>(&mref, 3);
+    test_prop_depth2_quant(&mref, &vars);
 }
 
 #[test]
 #[ignore]
 fn bcdd_prop_depth2_3vars_t2() {
     let mref = oxidd::bcdd::new_manager(65536, 1024, 2);
-    let vars = bdd_vars::<BCDDFunction>(&mref, 3);
-    test_prop_depth2_quant(&mref, &vars, &vars);
+    let vars = make_vars::<BCDDFunction>(&mref, 3);
+    test_prop_depth2_quant(&mref, &vars);
 }
 
 #[test]
 #[ignore]
 fn zbdd_prop_depth2_3vars_t1() {
     let mref = oxidd::zbdd::new_manager(65536, 1024, 1);
-    let (singletons, vars) = zbdd_singletons_vars(&mref, 3);
-    test_prop_depth2(&mref, &vars, &singletons);
+    let vars = make_vars::<ZBDDFunction>(&mref, 3);
+    test_prop_depth2(&mref, &vars);
 }
 
 #[test]
 #[ignore]
 fn zbdd_prop_depth2_3vars_t2() {
     let mref = oxidd::zbdd::new_manager(65536, 1024, 2);
-    let (singletons, vars) = zbdd_singletons_vars(&mref, 3);
-    test_prop_depth2(&mref, &vars, &singletons);
+    let vars = make_vars::<ZBDDFunction>(&mref, 3);
+    test_prop_depth2(&mref, &vars);
 }
 
 /// Explicit representation of a Boolean function (a column in a truth table)
@@ -420,8 +399,7 @@ type ExplicitBFunc = u32;
 /// Test operations on all Boolean function for a given variable set
 struct TestAllBooleanFunctions<'a, B: BooleanFunction> {
     mref: &'a B::ManagerRef,
-    vars: &'a [B],
-    var_handles: &'a [B],
+    nvars: u32,
     /// Stores all possible Boolean functions over `vars.len()` variables
     boolean_functions: Vec<B>,
     /// Map from Boolean functions as decision diagrams to their explicit
@@ -444,7 +422,7 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
         sets: &[u32],
     ) {
         if actual != expected {
-            let vars = self.vars.len() as u32;
+            let vars = self.nvars;
             let mut columns = Vec::with_capacity(operands.len() + 2);
             let op_it = operands.iter().copied();
             if operands.len() <= 3 {
@@ -474,7 +452,7 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
         panic!(
             "{desc}\n\n{}",
             util::debug::TruthTable {
-                vars: self.vars.len() as u32,
+                vars: self.nvars,
                 columns,
             }
         )
@@ -496,15 +474,15 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
     /// given variable set. `vars` are the Boolean functions representing the
     /// variables identified by `var_handles`. For BDDs, the two coincide, but
     /// not for ZBDDs.
-    pub fn init(mref: &'a B::ManagerRef, vars: &'a [B], var_handles: &'a [B]) -> Self {
-        assert_eq!(vars.len(), var_handles.len());
+    pub fn init(mref: &'a B::ManagerRef) -> Self {
+        let nvars = mref.with_manager_shared(|manager| manager.num_vars());
+
         assert!(
-            ExplicitBFunc::BITS.ilog2() as usize >= vars.len(),
+            ExplicitBFunc::BITS.ilog2() >= nvars,
             "too many variables, only {} are possible",
             ExplicitBFunc::BITS.ilog2()
         ); // actually, only 3 are possible in a feasible amount of time
 
-        let nvars = vars.len() as u32;
         let num_assignments = 1u32 << nvars;
         let num_functions: ExplicitBFunc = 1 << num_assignments;
         // Stores all possible Boolean functions with `nvars` vars
@@ -522,9 +500,9 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
                     let mut cube = B::t(manager);
                     for var in 0..nvars {
                         if assignment & (1 << var) != 0 {
-                            cube = cube.and(&vars[var as usize]).unwrap();
+                            cube = cube.and(&B::var(manager, var).unwrap()).unwrap();
                         } else {
-                            cube = cube.and(&vars[var as usize].not().unwrap()).unwrap();
+                            cube = cube.and(&B::not_var(manager, var).unwrap()).unwrap();
                         }
                     }
                     f = f.or(&cube).unwrap();
@@ -533,12 +511,7 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
                 // check that evaluating the function yields the desired values
                 for assignment in 0..(1u32 << nvars) {
                     let expected = explicit_f & (1 << assignment) != 0;
-                    let actual = f.eval(
-                        var_handles
-                            .iter()
-                            .enumerate()
-                            .map(|(i, var)| (var, assignment & (1 << i) != 0)),
-                    );
+                    let actual = f.eval((0..nvars).map(|i| (i, assignment & (1 << i) != 0)));
                     assert_eq!(actual, expected);
                 }
 
@@ -564,33 +537,33 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
 
         Self {
             mref,
-            vars,
-            var_handles,
+            nvars,
             boolean_functions,
             dd_to_boolean_func,
             var_functions,
         }
     }
 
-    fn make_var_set(&self, vars: u32) -> B {
-        let mut set = self.boolean_functions.last().unwrap().clone();
-        for (i, var) in self.vars.iter().enumerate() {
+    /// Create a set of variables represented as their conjunction
+    fn make_var_set(&self, vars: u32) -> ExplicitBFunc {
+        let mut conj = (1 << (1 << self.nvars)) - 1;
+        for (i, &var) in self.var_functions.iter().enumerate() {
             if vars & (1 << i) != 0 {
-                set = set.and(var).unwrap();
+                conj &= var;
             }
         }
-        set
+        conj
     }
 
-    fn make_cube(&self, positive: u32, negative: u32) -> B {
+    fn make_cube(&self, positive: u32, negative: u32) -> ExplicitBFunc {
         assert_eq!(positive & negative, 0);
 
-        let mut cube = self.boolean_functions.last().unwrap().clone();
-        for (i, var) in self.vars.iter().enumerate() {
+        let mut cube = (1 << (1 << self.nvars)) - 1; // ⊤
+        for (i, &var) in self.var_functions.iter().enumerate() {
             if (positive >> i) & 1 != 0 {
-                cube = cube.and(var).unwrap();
+                cube &= var;
             } else if (negative >> i) & 1 != 0 {
-                cube = cube.and(&var.not().unwrap()).unwrap();
+                cube &= !var;
             }
         }
 
@@ -599,26 +572,25 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
 
     /// Test basic operations on all Boolean functions
     pub fn basic(&self) {
-        let nvars = self.vars.len() as u32;
+        let nvars = self.nvars;
         let num_assignments = 1u32 << nvars;
         let num_functions: ExplicitBFunc = 1 << num_assignments;
         let func_mask = num_functions - 1;
 
-        // false & true
+        // false & true, vars
         self.mref.with_manager_shared(|manager| {
             assert!(B::f(manager) == self.boolean_functions[0]);
             assert!(&B::t(manager) == self.boolean_functions.last().unwrap());
-        });
 
-        // vars
-        for (i, var) in self.vars.iter().enumerate() {
-            let mut expected = 0;
-            for assignment in 0..num_assignments {
-                expected |= ((assignment >> i) & 1) << assignment;
+            for (i, &expected) in self.var_functions.iter().enumerate() {
+                let i = i as VarNo;
+                let actual = self.dd_to_boolean_func[&B::var(manager, i).unwrap()];
+                self.check("var", actual, expected, &[], &[]);
+
+                let actual = self.dd_to_boolean_func[&B::not_var(manager, i).unwrap()];
+                self.check("not var", actual, expected ^ func_mask, &[], &[]);
             }
-            let actual = self.dd_to_boolean_func[var];
-            assert_eq!(actual, expected);
-        }
+        });
 
         // arity >= 1
         for (f_explicit, f) in self.boolean_functions.iter().enumerate() {
@@ -689,14 +661,13 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
             }
 
             for assignment in 0..num_assignments {
-                // At first, we test `pick_cube()` and `pick_cube_symbolic()`,
-                // specifically that:
+                // At first, we test `pick_cube()` and `pick_cube_dd()`, specifically that:
                 //
                 // - The closure is called as specified (at most once for each level, `edge`
                 //   points to a node at that level)
                 // - The special case where `f` is ⊥ is handled correctly
-                // - In all other cases, the results of `pick_cube()` and `pick_cube_symbolic()`
-                //   * are equivalent (and the result of `pick_cube_symbolic()` can thus be
+                // - In all other cases, the results of `pick_cube()` and `pick_cube_dd()`
+                //   * are equivalent (and the result of `pick_cube_dd()` can thus be
                 //     represented as a conjunction of literals)
                 //   * imply the function
                 // - If the choice function was called for some level, the respective choice is
@@ -709,11 +680,11 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
                 // this would work for kinds of DDs without a linear variable order.
 
                 let mut choice_requested = 0u32;
-                let cube = f.pick_cube([], |manager, edge, level| {
-                    assert!(manager
+                let cube = f.pick_cube(|manager, edge, level| {
+                    manager
                         .get_node(edge)
                         .unwrap_inner()
-                        .check_level(|l| l == level));
+                        .assert_level_matches(level);
                     if choice_requested & (1 << level) != 0 {
                         panic!("choice requested twice for x{level}");
                     } else {
@@ -723,11 +694,11 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
                 });
                 let mut choice_requested_sym = 0u32;
                 let dd_cube = f
-                    .pick_cube_symbolic(|manager, edge, level| {
-                        assert!(manager
+                    .pick_cube_dd(|manager, edge, level| {
+                        manager
                             .get_node(edge)
                             .unwrap_inner()
-                            .check_level(|l| l == level));
+                            .assert_level_matches(level);
                         if choice_requested_sym & (1 << level) != 0 {
                             panic!("choice requested twice for x{level}");
                         } else {
@@ -739,7 +710,7 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
 
                 let actual = self.dd_to_boolean_func[&dd_cube];
                 if f_explicit == 0 {
-                    self.check("f.pick_cube_symbolic(..)", actual, 0, &[f_explicit], &[]);
+                    self.check("f.pick_cube_dd(..)", actual, 0, &[f_explicit], &[]);
                     assert_eq!(cube, None);
                     assert_eq!(choice_requested, 0);
                 } else {
@@ -748,8 +719,8 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
                     assert_eq!(cube.len(), nvars as usize);
                     self.check_cond(
                         actual & !f_explicit == 0,
-                        "f.pick_cube_symbolic(..) does not imply f",
-                        &[("f", f_explicit), ("f.pick_cube_symbolic(..)", actual)],
+                        "f.pick_cube_dd(..) does not imply f",
+                        &[("f", f_explicit), ("f.pick_cube_dd(..)", actual)],
                     );
 
                     let mut cube_func = func_mask;
@@ -774,10 +745,10 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
 
                             self.check_cond(
                                 flipped & !f_explicit != 0,
-                                format_args!("f.pick_cube_symbolic(..) should call the choice function or leave a don't care for x{var}"),
+                                format_args!("f.pick_cube_dd(..) should call the choice function or leave a don't care for x{var}"),
                                 &[
                                     ("f", f_explicit),
-                                    ("f.pick_cube_symbolic(..)", actual),
+                                    ("f.pick_cube_dd(..)", actual),
                                     ("cube with flipped literal", flipped),
                                 ],
                             );
@@ -796,7 +767,7 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
                     );
 
                     self.check(
-                        "f.pick_cube_symbolic(choice_fn) does not agree with f.pick_cube([], choice_fn)",
+                        "f.pick_cube_dd(choice_fn) does not agree with f.pick_cube([], choice_fn)",
                         actual,
                         cube_func,
                         &[f_explicit],
@@ -806,7 +777,7 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
 
                 assert_eq!(
                     choice_requested, choice_requested_sym,
-                    "pick_cube should request a choice iff pick_cube_symbolic requests a choice"
+                    "pick_cube should request a choice iff pick_cube_dd requests a choice"
                 );
             }
 
@@ -816,14 +787,13 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
                         continue;
                     }
 
-                    let literal_set = self.make_cube(pos, neg);
-                    let literal_set_explicit = self.dd_to_boolean_func[&literal_set];
-                    let actual =
-                        self.dd_to_boolean_func[&f.pick_cube_symbolic_set(&literal_set).unwrap()];
+                    let literal_set_explicit = self.make_cube(pos, neg);
+                    let literal_set = &self.boolean_functions[literal_set_explicit as usize];
+                    let actual = self.dd_to_boolean_func[&f.pick_cube_dd_set(literal_set).unwrap()];
 
                     if f_explicit == 0 {
                         self.check(
-                            "f.pick_cube_symbolic_set(g)",
+                            "f.pick_cube_dd_set(g)",
                             actual,
                             0,
                             &[f_explicit, literal_set_explicit],
@@ -832,11 +802,11 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
                     } else {
                         self.check_cond(
                             actual & !f_explicit == 0,
-                            "f.pick_cube_symbolic_set(literal_set) does not imply f",
+                            "f.pick_cube_dd_set(literal_set) does not imply f",
                             &[
                                 ("f", f_explicit),
                                 ("literal_set", literal_set_explicit),
-                                ("f.pick_cube_symbolic_set(literal_set)", actual),
+                                ("f.pick_cube_dd_set(literal_set)", actual),
                             ],
                         );
 
@@ -858,11 +828,11 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
                                 true
                             } else {
                                 self.panic(
-                                    format_args!("f.pick_cube_symbolic_set(literal_set) is not a cube (checking x{var})"),
+                                    format_args!("f.pick_cube_dd_set(literal_set) is not a cube (checking x{var})"),
                                     &[
                                         ("f", f_explicit),
                                         ("literal_set", literal_set_explicit),
-                                        ("f.pick_cube_symbolic_set(literal_set)", actual),
+                                        ("f.pick_cube_dd_set(literal_set)", actual),
                                     ],
                                 )
                             };
@@ -878,11 +848,11 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
 
                             self.check_cond(
                                 flipped & !f_explicit != 0,
-                                format_args!("f.pick_cube_symbolic_set(literal_set) does not follow the requirements from literal_set (selecting {selected} for x{var})"),
+                                format_args!("f.pick_cube_dd_set(literal_set) does not follow the requirements from literal_set (selecting {selected} for x{var})"),
                                 &[
                                     ("f", f_explicit),
                                     ("literal_set", literal_set_explicit),
-                                    ("f.pick_cube_symbolic_set(literal_set)", actual),
+                                    ("f.pick_cube_dd_set(literal_set)", actual),
                                     ("flipped", flipped),
                                 ],
                             );
@@ -894,15 +864,50 @@ impl<'a, B: BooleanFunction> TestAllBooleanFunctions<'a, B> {
     }
 }
 
-impl<'a, B: BooleanFunction + FunctionSubst> TestAllBooleanFunctions<'a, B> {
+impl<B: BooleanFunction + BooleanVecSet> TestAllBooleanFunctions<'_, B> {
+    fn subset_and_change(&self) {
+        for (f_explicit, f) in self.boolean_functions.iter().enumerate() {
+            let f_explicit = f_explicit as ExplicitBFunc;
+            for (v, &v_func) in self.var_functions.iter().enumerate() {
+                let v = v as VarNo;
+                self.check(
+                    "f.subset0(v)",
+                    self.dd_to_boolean_func[&f.subset0(v).unwrap()],
+                    f_explicit & !v_func,
+                    &[f_explicit],
+                    &[1 << v],
+                );
+
+                self.check(
+                    "f.subset1(v)",
+                    self.dd_to_boolean_func[&f.subset1(v).unwrap()],
+                    (f_explicit & v_func) >> (1 << v),
+                    &[f_explicit],
+                    &[1 << v],
+                );
+
+                self.check(
+                    "f.change(v)",
+                    self.dd_to_boolean_func[&f.change(v).unwrap()],
+                    ((f_explicit & !v_func) << (1 << v)) | ((f_explicit & v_func) >> (1 << v)),
+                    &[f_explicit],
+                    &[1 << v],
+                );
+            }
+        }
+    }
+}
+
+impl<B: BooleanFunction + FunctionSubst> TestAllBooleanFunctions<'_, B> {
     /// Test all possible substitutions
     pub fn subst(&self) {
-        self.subst_rec(&mut vec![None; self.vars.len()], 0);
+        self.subst_rec(&mut vec![None; self.nvars as usize], 0);
     }
 
     fn subst_rec(&self, replacements: &mut [Option<ExplicitBFunc>], current_var: u32) {
-        debug_assert_eq!(replacements.len(), self.vars.len());
-        if (current_var as usize) < self.vars.len() {
+        let nvars = self.nvars;
+        debug_assert_eq!(replacements.len(), nvars as usize);
+        if current_var < nvars {
             replacements[current_var as usize] = None;
             self.subst_rec(replacements, current_var + 1);
             for f in 0..self.boolean_functions.len() as ExplicitBFunc {
@@ -910,14 +915,13 @@ impl<'a, B: BooleanFunction + FunctionSubst> TestAllBooleanFunctions<'a, B> {
                 self.subst_rec(replacements, current_var + 1);
             }
         } else {
-            let nvars = self.vars.len() as u32;
             let num_assignments = 1u32 << nvars;
 
-            let mut subst_vars = Vec::with_capacity(self.vars.len());
-            let mut subst_repl = Vec::with_capacity(self.vars.len());
+            let mut subst_vars = Vec::with_capacity(nvars as usize);
+            let mut subst_repl = Vec::with_capacity(nvars as usize);
             for (i, &repl) in replacements.iter().enumerate() {
                 if let Some(repl) = repl {
-                    subst_vars.push(self.var_handles[i].clone());
+                    subst_vars.push(i as VarNo);
                     subst_repl.push(self.boolean_functions[repl as usize].clone());
                 }
             }
@@ -951,10 +955,10 @@ impl<'a, B: BooleanFunction + FunctionSubst> TestAllBooleanFunctions<'a, B> {
     }
 }
 
-impl<'a, B: BooleanFunctionQuant> TestAllBooleanFunctions<'a, B> {
+impl<B: BooleanFunctionQuant> TestAllBooleanFunctions<'_, B> {
     /// Test quantification operations on all Boolean function
     pub fn quant(&self) {
-        let nvars = self.vars.len() as ExplicitBFunc;
+        let nvars = self.nvars;
         let num_assignments = 1u32 << nvars;
         let num_functions: ExplicitBFunc = 1 << num_assignments;
         let func_mask = num_functions - 1;
@@ -966,7 +970,7 @@ impl<'a, B: BooleanFunctionQuant> TestAllBooleanFunctions<'a, B> {
                     continue; // positive and negative set must be disjoint
                 }
 
-                let dd_literal_set = self.make_cube(pos, neg);
+                let dd_literal_set = &self.boolean_functions[self.make_cube(pos, neg) as usize];
 
                 for (f_explicit, f) in self.boolean_functions.iter().enumerate() {
                     let f_explicit = f_explicit as ExplicitBFunc;
@@ -977,7 +981,7 @@ impl<'a, B: BooleanFunctionQuant> TestAllBooleanFunctions<'a, B> {
                         expected |= ((f_explicit >> assignment_restricted) & 1) << assignment;
                     }
 
-                    let actual = self.dd_to_boolean_func[&f.restrict(&dd_literal_set).unwrap()];
+                    let actual = self.dd_to_boolean_func[&f.restrict(dd_literal_set).unwrap()];
                     assert_eq!(actual, expected);
                 }
             }
@@ -986,7 +990,7 @@ impl<'a, B: BooleanFunctionQuant> TestAllBooleanFunctions<'a, B> {
         // quantification
         let mut assignment_to_mask: Vec<ExplicitBFunc> = vec![0; num_assignments as usize];
         for var_set in 0..num_assignments {
-            let dd_var_set = self.make_var_set(var_set);
+            let dd_var_set = &self.boolean_functions[self.make_var_set(var_set) as usize];
 
             // precompute `assignment_to_mask`
             for (assignment, mask) in assignment_to_mask.iter_mut().enumerate() {
@@ -1006,29 +1010,29 @@ impl<'a, B: BooleanFunctionQuant> TestAllBooleanFunctions<'a, B> {
             for (f_explicit, f) in self.boolean_functions.iter().enumerate() {
                 let f_explicit = f_explicit as ExplicitBFunc;
 
-                let mut exist_expected: ExplicitBFunc = 0;
+                let mut exists_expected: ExplicitBFunc = 0;
                 let mut forall_expected: ExplicitBFunc = 0;
                 let mut unique_expected: ExplicitBFunc = 0;
                 for (assignment, mask) in assignment_to_mask.iter().copied().enumerate() {
-                    let exist_bit = f_explicit & mask != 0; // or of all bits under mask
+                    let exists_bit = f_explicit & mask != 0; // or of all bits under mask
                     let forall_bit = f_explicit & mask == mask; // and of all bits under mask
                     let unique_bit = (f_explicit & mask).count_ones() & 1; // xor of all bits under mask
-                    exist_expected |= (exist_bit as ExplicitBFunc) << assignment;
+                    exists_expected |= (exists_bit as ExplicitBFunc) << assignment;
                     forall_expected |= (forall_bit as ExplicitBFunc) << assignment;
                     unique_expected |= (unique_bit as ExplicitBFunc) << assignment;
                 }
 
                 self.check(
                     "∃v. f",
-                    self.dd_to_boolean_func[&f.exist(&dd_var_set).unwrap()],
-                    exist_expected,
+                    self.dd_to_boolean_func[&f.exists(dd_var_set).unwrap()],
+                    exists_expected,
                     &[f_explicit],
                     &[var_set],
                 );
 
                 self.check(
                     "∀v. f",
-                    self.dd_to_boolean_func[&f.forall(&dd_var_set).unwrap()],
+                    self.dd_to_boolean_func[&f.forall(dd_var_set).unwrap()],
                     forall_expected,
                     &[f_explicit],
                     &[var_set],
@@ -1036,7 +1040,7 @@ impl<'a, B: BooleanFunctionQuant> TestAllBooleanFunctions<'a, B> {
 
                 self.check(
                     "∃!v. f",
-                    self.dd_to_boolean_func[&f.unique(&dd_var_set).unwrap()],
+                    self.dd_to_boolean_func[&f.unique(dd_var_set).unwrap()],
                     unique_expected,
                     &[f_explicit],
                     &[var_set],
@@ -1062,24 +1066,24 @@ impl<'a, B: BooleanFunctionQuant> TestAllBooleanFunctions<'a, B> {
 
                         self.check(
                             format_args!("∃v. f {inner_symbol} g"),
-                            self.dd_to_boolean_func[&f.apply_exist(op, g, &dd_var_set).unwrap()],
-                            self.dd_to_boolean_func[&inner.exist(&dd_var_set).unwrap()],
+                            self.dd_to_boolean_func[&f.apply_exists(op, g, dd_var_set).unwrap()],
+                            self.dd_to_boolean_func[&inner.exists(dd_var_set).unwrap()],
                             &[f_explicit, g_explicit],
                             &[var_set],
                         );
 
                         self.check(
                             format_args!("∀v. f {inner_symbol} g"),
-                            self.dd_to_boolean_func[&f.apply_forall(op, g, &dd_var_set).unwrap()],
-                            self.dd_to_boolean_func[&inner.forall(&dd_var_set).unwrap()],
+                            self.dd_to_boolean_func[&f.apply_forall(op, g, dd_var_set).unwrap()],
+                            self.dd_to_boolean_func[&inner.forall(dd_var_set).unwrap()],
                             &[f_explicit, g_explicit],
                             &[var_set],
                         );
 
                         self.check(
                             format_args!("∃!v. f {inner_symbol} g"),
-                            self.dd_to_boolean_func[&f.apply_unique(op, g, &dd_var_set).unwrap()],
-                            self.dd_to_boolean_func[&inner.unique(&dd_var_set).unwrap()],
+                            self.dd_to_boolean_func[&f.apply_unique(op, g, dd_var_set).unwrap()],
+                            self.dd_to_boolean_func[&inner.unique(dd_var_set).unwrap()],
                             &[f_explicit, g_explicit],
                             &[var_set],
                         );
@@ -1090,12 +1094,30 @@ impl<'a, B: BooleanFunctionQuant> TestAllBooleanFunctions<'a, B> {
     }
 }
 
+fn setup_manager<MR: ManagerRef>(
+    new_manager: fn(usize, usize, u32) -> MR,
+    threads: u32,
+    nvars: VarNo,
+) -> MR
+where
+    for<'id> MR::Manager<'id>: HasWorkers,
+{
+    let mref = new_manager(65536, 1024, threads);
+    let r = mref.with_manager_exclusive(|manager| {
+        if threads > 1 {
+            manager.workers().set_split_depth(Some(u32::MAX));
+        }
+        manager.add_vars(nvars)
+    });
+    assert_eq!(r, (0..nvars));
+    mref
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn bdd_all_boolean_functions_2vars_t1() {
-    let mref = oxidd::bdd::new_manager(65536, 1024, 1);
-    let vars = bdd_vars::<BDDFunction>(&mref, 2);
-    let test = TestAllBooleanFunctions::init(&mref, &vars, &vars);
+    let mref = setup_manager(oxidd::bdd::new_manager, 1, 2);
+    let test = TestAllBooleanFunctions::<'_, BDDFunction>::init(&mref);
     test.basic();
     test.subst();
     test.quant();
@@ -1104,10 +1126,8 @@ fn bdd_all_boolean_functions_2vars_t1() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn bdd_all_boolean_functions_2vars_t2() {
-    let mref = oxidd::bdd::new_manager(65536, 1024, 2);
-    mref.with_manager_shared(|manager| manager.set_split_depth(Some(u32::MAX)));
-    let vars = bdd_vars::<BDDFunction>(&mref, 2);
-    let test = TestAllBooleanFunctions::init(&mref, &vars, &vars);
+    let mref = setup_manager(oxidd::bdd::new_manager, 2, 2);
+    let test = TestAllBooleanFunctions::<'_, BDDFunction>::init(&mref);
     test.basic();
     test.subst();
     test.quant();
@@ -1116,9 +1136,8 @@ fn bdd_all_boolean_functions_2vars_t2() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn bcdd_all_boolean_functions_2vars_t1() {
-    let mref = oxidd::bcdd::new_manager(65536, 1024, 1);
-    let vars = bdd_vars::<BCDDFunction>(&mref, 2);
-    let test = TestAllBooleanFunctions::init(&mref, &vars, &vars);
+    let mref = setup_manager(oxidd::bcdd::new_manager, 1, 2);
+    let test = TestAllBooleanFunctions::<'_, BCDDFunction>::init(&mref);
     test.basic();
     test.subst();
     test.quant();
@@ -1127,10 +1146,8 @@ fn bcdd_all_boolean_functions_2vars_t1() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn bcdd_all_boolean_functions_2vars_t2() {
-    let mref = oxidd::bcdd::new_manager(65536, 1024, 2);
-    mref.with_manager_shared(|manager| manager.set_split_depth(Some(u32::MAX)));
-    let vars = bdd_vars::<BCDDFunction>(&mref, 2);
-    let test = TestAllBooleanFunctions::init(&mref, &vars, &vars);
+    let mref = setup_manager(oxidd::bcdd::new_manager, 2, 2);
+    let test = TestAllBooleanFunctions::<'_, BCDDFunction>::init(&mref);
     test.basic();
     test.subst();
     test.quant();
@@ -1139,18 +1156,17 @@ fn bcdd_all_boolean_functions_2vars_t2() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn zbdd_all_boolean_functions_2vars_t1() {
-    let mref = oxidd::zbdd::new_manager(65536, 1024, 1);
-    let (singletons, vars) = zbdd_singletons_vars(&mref, 2);
-    let test = TestAllBooleanFunctions::init(&mref, &vars, &singletons);
+    let mref = setup_manager(oxidd::zbdd::new_manager, 1, 2);
+    let test = TestAllBooleanFunctions::<'_, ZBDDFunction>::init(&mref);
     test.basic();
+    test.subset_and_change();
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn zbdd_all_boolean_functions_2vars_t2() {
-    let mref = oxidd::zbdd::new_manager(65536, 1024, 2);
-    mref.with_manager_shared(|manager| manager.set_split_depth(Some(u32::MAX)));
-    let (singletons, vars) = zbdd_singletons_vars(&mref, 2);
-    let test = TestAllBooleanFunctions::init(&mref, &vars, &singletons);
+    let mref = setup_manager(oxidd::zbdd::new_manager, 2, 2);
+    let test = TestAllBooleanFunctions::<'_, ZBDDFunction>::init(&mref);
     test.basic();
+    test.subset_and_change();
 }

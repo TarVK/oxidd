@@ -4,22 +4,17 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use is_sorted::IsSorted;
-use oxidd_core::util::OutOfMemory;
-use oxidd_core::WorkerManager;
 use smallvec::SmallVec;
 
-use oxidd_core::function::Function;
-use oxidd_core::util::AbortOnDrop;
-use oxidd_core::util::Borrowed;
-use oxidd_core::util::DropWith;
-use oxidd_core::DiagramRules;
-use oxidd_core::Edge;
-use oxidd_core::HasLevel;
-use oxidd_core::InnerNode;
-use oxidd_core::LevelNo;
-use oxidd_core::LevelView;
-use oxidd_core::Manager;
-use oxidd_core::ReducedOrNew;
+use oxidd_core::error::OutOfMemory;
+use oxidd_core::util::{AbortOnDrop, Borrowed, DropWith};
+use oxidd_core::{
+    DiagramRules, Edge, HasLevel, HasWorkers, InnerNode, LevelNo, LevelView, Manager, Node,
+    ReducedOrNew, VarNo, WorkerPool,
+};
+
+mod segtree;
+use segtree::MinSegTree;
 
 /// Swap the level given by `upper_no` with the level directly below.
 ///
@@ -28,7 +23,7 @@ use oxidd_core::ReducedOrNew;
 /// Must be called from inside the closure of
 /// [`manager.reorder()`][Manager::reorder]. `manager` must be derived from a
 /// `&mut M` reference. This function may modify nodes at the level of
-/// `upper_no` and `upper_no + 1` (i.e. the level below). There must not be any
+/// `upper_no` and `upper_no + 1` (i.e., the level below). There must not be any
 /// concurrent modification of any nodes at these levels.
 pub unsafe fn level_down<M: Manager>(manager: &M, upper_no: LevelNo)
 where
@@ -69,7 +64,7 @@ where
 
         if children
             .iter()
-            .all(|c| manager.get_node(c).unwrap_inner().level() > lower_no)
+            .all(|c| manager.get_node(c).level() > lower_no)
         {
             // All children are below the lower level, we just move the node to
             // the lower level.
@@ -88,16 +83,23 @@ where
         let grandchildren: SmallVec<[_; 2]> = children
             .iter()
             .map(|c| {
-                let node = manager.get_node(c).unwrap_inner();
-                if node.level() == lower_no {
-                    // We have exclusive access to the node
-                    let children: SmallVec<[_; 2]> = M::Rules::cofactors(c.tag(), node).collect();
-                    debug_assert_eq!(children.len(), M::InnerNode::ARITY);
-                    children
-                } else {
-                    // The child is below the lower level, so we always have
-                    // this child
-                    (0..M::InnerNode::ARITY).map(|_| c.borrowed()).collect()
+                // A child of a node at the old upper level can only reference
+                // a node at the old lower, i.e., the new upper level, or any
+                // level below `lower_no`.
+                match manager.get_node(c) {
+                    Node::Inner(node) if node.level() == upper_no => {
+                        // We have exclusive access to the node
+                        let children: SmallVec<[_; 2]> =
+                            M::Rules::cofactors(c.tag(), node).collect();
+                        debug_assert_eq!(children.len(), M::InnerNode::ARITY);
+                        children
+                    }
+                    node => {
+                        debug_assert!(node.level() > lower_no);
+                        // The child is below the lower level, so we always have
+                        // this child
+                        (0..M::InnerNode::ARITY).map(|_| c.borrowed()).collect()
+                    }
                 }
             })
             .collect();
@@ -135,12 +137,13 @@ where
             // level. (A child might also be at some lower level, in which case
             // the node could also be removed. However we must not access such
             // a node.)
-            let child_node = manager.get_node(&*child).unwrap_inner();
-            if child_node.level() == upper_no && child_node.ref_count() == 1 {
-                // The main reference corresponds to the old node, which is
-                // deleted below. The weak reference is the one in the unique
-                // table. Hence, we can remove the node.
-                unsafe { upper.remove(child_node) };
+            if let Node::Inner(child_node) = manager.get_node(&*child) {
+                if child_node.level() == upper_no && child_node.ref_count() == 1 {
+                    // The main reference corresponds to the old node, which is
+                    // deleted below. The weak reference is the one in the unique
+                    // table. Hence, we can remove the node.
+                    upper.remove(child_node);
+                }
             }
         }
 
@@ -155,15 +158,21 @@ where
     abort_on_panic.defuse();
 }
 
-/// Reorder the variables such that the edges in `order` are sorted by their
-/// levels.
+/// Reorder the variables according to `order`
 ///
 /// Sequential version of [`set_var_order()`].
 ///
-/// The caller must not call [`manager.reorder()`][Manager::reorder].
-pub fn set_var_order_seq<'id, F: Function>(manager: &mut F::Manager<'id>, order: &[F])
+/// If a variable `x` occurs before variable `y` in `order`, then `x` will be
+/// above `y` in the decision diagram when this function returns. Variables not
+/// mentioned in `order` will be placed in a position such that the least number
+/// of level swaps need to be performed. Panics if a variable occurs twice in
+/// `order`.
+///
+/// There is no need for the caller to call
+/// [`manager.reorder()`][Manager::reorder], this is done internally.
+pub fn set_var_order_seq<M: Manager>(manager: &mut M, order: &[VarNo])
 where
-    <F::Manager<'id> as Manager>::InnerNode: HasLevel,
+    M::InnerNode: HasLevel,
 {
     if order.len() <= 1 {
         return; // nothing to do
@@ -171,12 +180,7 @@ where
 
     let mut target_order = sort_order(
         manager.num_levels(),
-        order.iter().map(|f| {
-            manager
-                .get_node(f.as_edge(manager))
-                .expect_inner("order must not contain (const) terminals")
-                .level()
-        }),
+        order.iter().map(|&v| manager.var_to_level(v)),
     );
 
     manager.reorder(|manager| {
@@ -186,40 +190,37 @@ where
         });
     });
 
-    debug_assert!(IsSorted::is_sorted(&mut order.iter().map(|f| {
-        let edge = f.as_edge(manager);
-        manager.get_node(edge).unwrap_inner().level()
-    })));
+    debug_assert!(IsSorted::is_sorted(
+        &mut order.iter().map(|&v| manager.var_to_level(v))
+    ));
 }
 
-/// Reorder the variables such that the edges in `order` are sorted by their
-/// levels.
+/// Reorder the variables according to `order`
 ///
-/// Like [`set_var_order_seq()`] but with concurrent swap operations.
+/// Like [`set_var_order_seq()`], but with concurrent swap operations.
 ///
-/// The caller must not call [`manager.reorder()`][Manager::reorder].
-pub fn set_var_order<'id, F: Function>(manager: &mut F::Manager<'id>, order: &[F])
+/// If a variable `x` occurs before variable `y` in `order`, then `x` will be
+/// above `y` in the decision diagram when this function returns. Variables not
+/// mentioned in `order` will be placed in a position such that the least number
+/// of level swaps need to be performed. Panics if a variable occurs twice in
+/// `order`.
+///
+/// There is no need for the caller to call
+/// [`manager.reorder()`][Manager::reorder], this is done internally.
+pub fn set_var_order<M>(manager: &mut M, order: &[VarNo])
 where
-    F::Manager<'id>: Manager + WorkerManager,
-    <F::Manager<'id> as Manager>::InnerNode: HasLevel,
+    M: Manager + HasWorkers,
+    M::InnerNode: HasLevel,
 {
     if order.len() <= 1 {
         return; // nothing to do
     }
 
     let num_levels = manager.num_levels();
-    let mut target_order = sort_order(
-        num_levels,
-        order.iter().map(|f| {
-            manager
-                .get_node(f.as_edge(manager))
-                .expect_inner("order must not contain (const) terminals")
-                .level()
-        }),
-    );
+    let mut target_order = sort_order(num_levels, order.iter().map(|&v| manager.var_to_level(v)));
 
     manager.reorder(|manager| {
-        if num_levels <= 8 {
+        if num_levels <= 16 || manager.workers().current_num_threads() == 1 {
             bubble_sort(&mut target_order, |upper_no| unsafe {
                 level_down(manager, upper_no)
             });
@@ -230,27 +231,27 @@ where
         }
     });
 
-    debug_assert!(IsSorted::is_sorted(&mut order.iter().map(|f| {
-        let edge = f.as_edge(manager);
-        manager.get_node(edge).unwrap_inner().level()
-    })));
+    debug_assert!(IsSorted::is_sorted(
+        &mut order.iter().map(|&v| manager.var_to_level(v))
+    ));
 }
 
 /// Transform the `input_order` into a target order suitable for sorting, that
-/// is: if the value at index `i` is greater than the value at index `i + 1`,
+/// is: If the value at index `i` is greater than the value at index `i + 1`,
 /// then level `i` and `i + 1` need to be swapped.
 ///
-/// `input_order` conceptually describes how the variables should be ordered in
-/// the end, i.e. the variables corresponding to the given levels should be
+/// `input_order` describes how the variables should be ordered in the end,
+/// i.e., the variables corresponding to the given levels should be
 /// reordered such that the level numbers would be increasing in that order.
-fn sort_order(num_levels: u32, input_order: impl IntoIterator<Item = LevelNo>) -> Vec<LevelNo> {
-    let mut target_order = vec![LevelNo::MAX; num_levels as usize];
+#[track_caller]
+fn sort_order(num_levels: u32, input_order: impl IntoIterator<Item = LevelNo>) -> Vec<u32> {
+    let mut target_order = vec![u32::MAX; num_levels as usize];
     let mut input_order_len = 0;
     for level in input_order {
         assert_eq!(
             target_order[level as usize],
             u32::MAX,
-            "`order` contains level {level} twice but it must be a permutation of the present levels"
+            "`order` contains level {level} twice"
         );
         target_order[level as usize] = input_order_len;
         input_order_len += 1;
@@ -273,172 +274,14 @@ fn sort_order(num_levels: u32, input_order: impl IntoIterator<Item = LevelNo>) -
         }
     }
 
-    debug_assert!(!target_order.contains(&LevelNo::MAX));
+    debug_assert!(!target_order.contains(&u32::MAX));
 
     target_order
 }
 
-/// A segment tree that allows additive range updates (in O(log n)) and queries
-/// for the index of some minimal element (in O(log n), could be optimized to
-/// O(1) by adding a `min_index` field to `MinSegTreeEntry`)
-#[derive(PartialEq, Eq)]
-struct MinSegTree(Vec<MinSegTreeEntry>);
-
-#[derive(Copy, Clone, PartialEq, Eq)]
-struct MinSegTreeEntry {
-    delta: i32,
-    /// The minimum value of the children + self.delta
-    min: i32,
-}
-
-impl MinSegTree {
-    #[inline]
-    fn parent(i: usize) -> usize {
-        i / 2
-    }
-    #[inline]
-    fn left(i: usize) -> usize {
-        2 * i
-    }
-    #[inline]
-    fn right(i: usize) -> usize {
-        2 * i + 1
-    }
-    #[inline]
-    fn is_left_child(i: usize) -> bool {
-        i % 2 == 0
-    }
-
-    fn new(data: impl ExactSizeIterator<Item = i32>) -> Self {
-        let size = data.len().next_power_of_two();
-        let mut tree = Vec::with_capacity(2 * size);
-        tree.resize(size, MinSegTreeEntry { delta: 0, min: 0 });
-        tree.extend(data.map(|v| MinSegTreeEntry { delta: v, min: v }));
-        tree.resize(
-            2 * size,
-            MinSegTreeEntry {
-                delta: i32::MAX,
-                min: i32::MAX,
-            },
-        );
-
-        for i in (1..size).rev() {
-            tree[i].min =
-                tree[i].delta + std::cmp::min(tree[Self::left(i)].min, tree[Self::right(i)].min);
-        }
-
-        MinSegTree(tree)
-    }
-
-    /// Add `left` to all elements in range `..i` and `right` to all elements in
-    /// `i..`
-    fn add_split(&mut self, i: usize, left: i32, right: i32) {
-        let mut size = self.0.len() / 2;
-        assert!(i <= size);
-
-        #[inline]
-        fn update(entry: &mut MinSegTreeEntry, delta: i32) {
-            if entry.min != i32::MAX {
-                entry.delta += delta;
-                entry.min += delta;
-            }
-        }
-
-        // Special case: borders. Either there is nothing to the left to modify,
-        // or nothing to the right.
-        if i == 0 {
-            update(&mut self.0[1], right);
-            return;
-        }
-        if i == size {
-            update(&mut self.0[1], left);
-            return;
-        }
-
-        let mut levels_from_bot = size.trailing_zeros();
-        let mut node = 1;
-
-        loop {
-            levels_from_bot -= 1;
-            size /= 2;
-            if i & (size - 1) /* i % size */ == 0 {
-                break;
-            }
-            if Self::is_left_child(i >> levels_from_bot) {
-                node = Self::left(node);
-                update(&mut self.0[node + 1], right);
-            } else {
-                node = Self::right(node);
-                update(&mut self.0[node - 1], left);
-            }
-        }
-        update(&mut self.0[Self::left(node)], left);
-        update(&mut self.0[Self::right(node)], right);
-
-        loop {
-            let l = Self::left(node);
-            let r = Self::right(node);
-            self.0[node].min = self.0[node].delta + std::cmp::min(self.0[l].min, self.0[r].min);
-            if node == 1 {
-                break;
-            }
-            node = Self::parent(node);
-        }
-    }
-
-    /// Get the index of the minimal element with the lowest index
-    fn min_index(&self) -> usize {
-        let size = self.0.len() / 2;
-        let mut i = 1;
-        while i < size {
-            let l = Self::left(i);
-            let r = Self::right(i);
-            i = if self.0[l].min <= self.0[r].min { l } else { r };
-        }
-        i - size
-    }
-
-    /// Project the segment tree down to an array (apply all deltas)
-    ///
-    /// For debugging purposes
-    #[allow(unused)]
-    fn proj(&self) -> Vec<i32> {
-        fn rec(inp: &[MinSegTreeEntry], out: &mut [i32], i: usize, sum: i32) {
-            let sum = sum + inp[i].delta;
-            if i >= out.len() {
-                out[i - out.len()] = sum;
-            } else {
-                rec(inp, out, MinSegTree::left(i), sum);
-                rec(inp, out, MinSegTree::right(i), sum);
-            }
-        }
-
-        let size = self.0.len() / 2;
-        let mut res: Vec<i32> = vec![0; size];
-        rec(&self.0, &mut res, 1, 0);
-        res
-    }
-}
-
-impl std::fmt::Debug for MinSegTree {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut i = 1;
-        writeln!(f, "MinSegTree {{")?;
-        write!(f, "    ({}/{})", self.0[0].delta, self.0[0].min)?;
-        while i < self.0.len() {
-            write!(f, "\n   ")?;
-            for entry in &self.0[i..2 * i] {
-                write!(f, " {}/{}", entry.delta, entry.min)?;
-            }
-            i *= 2;
-        }
-        write!(f, "\n}}")
-    }
-}
-
 /// Sorts the given sequence by swapping adjacent levels only. For every swap
 /// operation, `swap` is called with the smaller index.
-fn bubble_sort(seq: &mut [LevelNo], mut swap: impl FnMut(LevelNo)) {
+fn bubble_sort(seq: &mut [u32], mut swap: impl FnMut(LevelNo)) {
     let mut n = seq.len();
     while n > 1 {
         let mut new_n = 0;
@@ -460,9 +303,9 @@ fn bubble_sort(seq: &mut [LevelNo], mut swap: impl FnMut(LevelNo)) {
 /// implementation ensures that if there is a swap operation for indices `i` and
 /// `i + 1`, there is no other swap operation with `i` and `i + 1` at the same
 /// time.
-fn concurrent_bubble_sort<M, F>(manager: &M, seq: Vec<LevelNo>, swap: F)
+fn concurrent_bubble_sort<M, F>(manager: &M, seq: Vec<u32>, swap: F)
 where
-    M: WorkerManager,
+    M: HasWorkers,
     F: Fn(LevelNo) + Sync,
 {
     if IsSorted::is_sorted(&mut seq.iter()) {
@@ -511,7 +354,7 @@ where
         debug_assert!(IsSorted::is_sorted(&mut seq.iter()));
     });
 
-    manager.broadcast(|_| {
+    manager.workers().broadcast(|_| {
         while let Ok(upper) = task_receiver.recv() {
             swap(upper);
             done_sender.send(upper).unwrap();
@@ -525,15 +368,6 @@ mod test {
     use std::sync::atomic::Ordering::Relaxed;
 
     use super::*;
-
-    macro_rules! segtree {
-        ($($d:expr,$m:expr);*;) => {
-            MinSegTree(vec![
-                MinSegTreeEntry { delta: 0, min: 0 },
-                $(MinSegTreeEntry { delta: $d, min: $m }),*
-            ])
-        };
-    }
 
     #[test]
     fn test_sort_order() {
@@ -549,89 +383,6 @@ mod test {
             sort_order(8, [7, 3, 0, 5, 6, 1]),
             vec![2, 5, 0, 1, 3, 3, 4, 0]
         );
-    }
-
-    #[test]
-    fn test_segtree_new() {
-        assert_eq!(MinSegTree::new(2..3), segtree![2,2;]);
-
-        assert_eq!(
-            MinSegTree::new([-2, 5, 3, -2, -3, 4].into_iter()),
-            segtree![
-                0,-3;
-                0,-2;                   0,-3;
-                0,-2;       0,-2;       0,-3;       0,i32::MAX;
-                -2,-2; 5,5; 3,3; -2,-2; -3,-3; 4,4; i32::MAX,i32::MAX; i32::MAX,i32::MAX;
-            ]
-        );
-    }
-
-    #[test]
-    fn test_segtree_min_idx() {
-        assert_eq!(MinSegTree::new(-42..42).min_index(), 0);
-        assert_eq!(MinSegTree::new([2, -3, 1].into_iter()).min_index(), 1);
-        assert_eq!(MinSegTree::new([2, -3, -11].into_iter()).min_index(), 2);
-        assert_eq!(MinSegTree::new([4, 3, 2, 0].into_iter()).min_index(), 3);
-        assert_eq!(MinSegTree::new([4, 0, 2, 0].into_iter()).min_index(), 1);
-    }
-
-    #[test]
-    fn test_segtree_add_split() {
-        let mut st = MinSegTree::new([4, 0, 2, 1].into_iter());
-        st.add_split(0, -2, 2);
-        assert_eq!(
-            st,
-            segtree![
-                2,2;
-                0,0;      0,1;
-                4,4; 0,0; 2,2; 1,1;
-            ]
-        );
-        st.add_split(4, -1, 2);
-        assert_eq!(
-            st,
-            segtree![
-                1,1;
-                0,0;      0,1;
-                4,4; 0,0; 2,2; 1,1;
-            ]
-        );
-        st.add_split(2, 1, -2);
-        assert_eq!(
-            st,
-            segtree![
-                1,0;
-                1,1;      -2,-1;
-                4,4; 0,0; 2,2; 1,1;
-            ]
-        );
-        st.add_split(1, -4, 1);
-        assert_eq!(
-            st,
-            segtree![
-                1,1;
-                1,1;      -1,0;
-                0,0; 1,1; 2,2; 1,1;
-            ]
-        );
-
-        assert_eq!(st.min_index(), 3);
-    }
-
-    #[test]
-    fn test_segtree_add_split_unused() {
-        let mut st = MinSegTree::new([0, 1, 2, 3, 4].into_iter());
-        st.add_split(5, 1, -1);
-        assert_eq!(
-            st,
-            segtree![
-                0,1;
-                1,1;                0,5;
-                0,0;      0,2;      0,5;                    0,i32::MAX;
-                0,0; 1,1; 2,2; 3,3; 5,5; i32::MAX,i32::MAX; i32::MAX,i32::MAX; i32::MAX,i32::MAX;
-            ]
-        );
-        assert_eq!(st.min_index(), 0);
     }
 
     macro_rules! bubble_sort_test_case {

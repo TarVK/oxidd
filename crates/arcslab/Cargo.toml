@@ -1,10 +1,9 @@
 [package]
 name = "arcslab"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Slab, but with reference counted items"
 
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -13,7 +12,7 @@ repository.workspace = true
 [dependencies]
 
 # strict provenance polyfill
-# (TODO: remove this once the `strict_provenance` feature becomes stable)
+# (TODO: remove this once we raise the MSRV to 1.84)
 sptr = "0.3"
 
 # fast alternative Mutex & RwLock implementation
@@ -21,6 +20,9 @@ parking_lot = "0.12"
 
 # `CachePadded`
 crossbeam-utils = { version = "0.8", default-features = false }
+
+# standard derive macros but with custom bounds on generics
+derive-where = "1.5"
 
 [target.'cfg(all(not(miri), target_os = "linux"))'.dependencies]
 # `madvise`

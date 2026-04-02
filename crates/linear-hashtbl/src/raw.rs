@@ -5,10 +5,12 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 
+#[cfg(all(feature = "nightly", not(feature = "allocator-api2")))]
+use alloc::{alloc::Allocator, alloc::Global, boxed::Box, vec::Vec};
 #[cfg(feature = "allocator-api2")]
 use allocator_api2::{alloc::Allocator, alloc::Global, boxed::Box, vec::Vec};
 
-#[cfg(not(feature = "allocator-api2"))]
+#[cfg(not(any(feature = "allocator-api2", feature = "nightly")))]
 use {
     crate::__alloc::{Allocator, Global},
     alloc::{boxed::Box, vec::Vec},
@@ -18,9 +20,9 @@ use {
 
 /// Raw hash table with a (partially) unsafe API
 pub struct RawTable<T, S: Status = usize, A: Allocator + Clone = Global> {
-    #[cfg(feature = "allocator-api2")]
+    #[cfg(any(feature = "allocator-api2", feature = "nightly"))]
     data: Box<[Slot<T, S>], A>,
-    #[cfg(not(feature = "allocator-api2"))]
+    #[cfg(not(any(feature = "allocator-api2", feature = "nightly")))]
     data: Box<[Slot<T, S>]>,
 
     /// The number of items in the table
@@ -60,7 +62,9 @@ pub struct IterMut<'a, T, S: Status = usize> {
 pub struct IntoIter<T, S: Status = usize, A: Allocator = Global> {
     #[cfg(feature = "allocator-api2")]
     iter: allocator_api2::vec::IntoIter<Slot<T, S>, A>,
-    #[cfg(not(feature = "allocator-api2"))]
+    #[cfg(all(not(feature = "allocator-api2"), feature = "nightly"))]
+    iter: alloc::vec::IntoIter<Slot<T, S>, A>,
+    #[cfg(not(any(feature = "allocator-api2", feature = "nightly")))]
     iter: alloc::vec::IntoIter<Slot<T, S>>,
     len: usize,
     phantom: PhantomData<A>,
@@ -142,7 +146,7 @@ unsafe impl Status for usize {
 
     #[inline]
     fn is_hash(self) -> bool {
-        self <= usize::MAX >> 1
+        self >> (usize::BITS - 1) == 0 // most significant bit is unset
     }
 
     #[inline]
@@ -173,7 +177,7 @@ unsafe impl Status for u32 {
 
     #[inline]
     fn is_hash(self) -> bool {
-        self <= u32::MAX >> 1
+        self >> (u32::BITS - 1) == 0 // most significant bit is unset
     }
 
     #[inline]
@@ -224,9 +228,7 @@ impl<T, S: Status> RawTable<T, S> {
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = Self::next_capacity(capacity);
         let mut data = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            data.push(Slot::FREE);
-        }
+        data.resize_with(capacity, || Slot::FREE);
         RawTable {
             data: data.into_boxed_slice(),
             len: 0,
@@ -236,7 +238,7 @@ impl<T, S: Status> RawTable<T, S> {
     }
 }
 
-#[cfg(feature = "allocator-api2")]
+#[cfg(any(feature = "allocator-api2", feature = "nightly"))]
 impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
     /// Create a new `HashTable` with zero capacity
     #[inline]
@@ -253,12 +255,7 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
         let capacity = Self::next_capacity(capacity);
         let mut data = Vec::with_capacity_in(capacity, alloc);
-        for _ in 0..capacity {
-            data.push(Slot {
-                status: S::FREE,
-                data: MaybeUninit::uninit(),
-            });
-        }
+        data.resize_with(capacity, || Slot::FREE);
         RawTable {
             data: data.into_boxed_slice(),
             len: 0,
@@ -267,6 +264,14 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
         }
     }
 }
+
+/// Numerator for the fraction of usable slots
+const RATIO_N: usize = 3;
+/// Denominator for the fraction of usable slots
+const RATIO_D: usize = 4;
+
+/// Minimal non-zero capacity (including spare slots)
+const MIN_CAP: usize = 16;
 
 impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
     /// Get the next largest array capacity for `requested` elements
@@ -282,7 +287,7 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
         if requested == 0 {
             return 0;
         }
-        let capacity = core::cmp::max((requested * 4 / 3).next_power_of_two(), 16);
+        let capacity = core::cmp::max((requested * RATIO_D / RATIO_N).next_power_of_two(), MIN_CAP);
         S::check_capacity(capacity);
         capacity
     }
@@ -301,7 +306,7 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
     /// Get the capacity (excluding spare slots)
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.data.len() / 4 * 3
+        self.data.len() / RATIO_D * RATIO_N
     }
 
     /// Get the number of slots (i.e. [`Self::capacity()`] plus spare slots)
@@ -317,7 +322,8 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
     /// of the table.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
-        if self.free < additional + self.data.len() / 4 {
+        let spare = additional + self.data.len() / RATIO_D * (RATIO_D - RATIO_N);
+        if self.free < spare {
             self.reserve_rehash(additional)
         }
     }
@@ -326,21 +332,23 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
     fn reserve_rehash(&mut self, additional: usize) {
         let new_cap = Self::next_capacity(self.len + additional);
 
-        #[cfg(feature = "allocator-api2")]
-        let (empty, mut new_data) = {
-            let alloc = Box::allocator(&self.data).clone();
-            let empty = Vec::new_in(alloc.clone());
-            (empty, Vec::with_capacity_in(new_cap, alloc))
-        };
-        #[cfg(not(feature = "allocator-api2"))]
-        let (empty, mut new_data) = (Vec::new(), Vec::with_capacity(new_cap));
-
-        let old_data = core::mem::replace(&mut self.data, empty.into_boxed_slice()).into_vec();
+        #[cfg(any(feature = "allocator-api2", feature = "nightly"))]
+        let mut new_data = Vec::with_capacity_in(new_cap, Box::allocator(&self.data).clone());
+        #[cfg(not(any(feature = "allocator-api2", feature = "nightly")))]
+        let mut new_data = Vec::with_capacity(new_cap);
 
         new_data.resize_with(new_cap, || Slot::FREE);
+        let old_data = core::mem::replace(&mut self.data, new_data.into_boxed_slice());
 
+        if new_cap == 0 {
+            self.free = 0;
+            return;
+        }
+
+        let new_data = &mut self.data[..];
         let new_mask = new_cap - 1;
-        for slot in old_data {
+        // `.into_vec()` is needed for `allocator-api2` boxes
+        for slot in old_data.into_vec() {
             let status = slot.status;
             if !status.is_hash() {
                 continue;
@@ -361,7 +369,6 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
             }
         }
 
-        self.data = new_data.into_boxed_slice();
         self.free = new_cap - self.len;
     }
 
@@ -411,16 +418,16 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
 
     /// Like [`Self::clear_no_drop()`], but also sets the capacity to 0
     ///
-    /// If the space is not needed anymore, this should generally be faster
+    /// If the space is not needed anymore, this should generally be faster than
     /// [`Self::clear_no_drop()`], since we do not need to mark every slot as
     /// free.
     #[inline]
     pub fn reset_no_drop(&mut self) {
         self.len = 0;
 
-        #[cfg(feature = "allocator-api2")]
+        #[cfg(any(feature = "allocator-api2", feature = "nightly"))]
         let empty = Vec::new_in(Box::allocator(&self.data).clone());
-        #[cfg(not(feature = "allocator-api2"))]
+        #[cfg(not(any(feature = "allocator-api2", feature = "nightly")))]
         let empty = Vec::new();
         self.data = empty.into_boxed_slice();
     }
@@ -440,10 +447,10 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
     /// Find the index of an element or a slot
     #[inline]
     pub fn find(&self, hash: u64, eq: impl Fn(&T) -> bool) -> Option<usize> {
-        debug_assert_ne!(self.free, 0, "find may diverge");
         if self.len == 0 {
             return None;
         }
+        debug_assert_ne!(self.free, 0, "find may diverge");
 
         debug_assert!(self.data.len().is_power_of_two());
         let mask = self.data.len() - 1;
@@ -496,7 +503,7 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
                 }
             } else if slot.status == S::FREE {
                 return Err(first_tombstone.unwrap_or(index));
-            } else if slot.status == S::TOMBSTONE {
+            } else if slot.status == S::TOMBSTONE && first_tombstone.is_none() {
                 first_tombstone = Some(index);
             }
             index = (index + 1) & mask;
@@ -615,7 +622,7 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
         debug_assert!(self.data[slot].status.is_hash());
         let next_slot_index = (slot + 1) & (self.data.len() - 1);
         // SAFETY (next 2): The caller ensures that `slot` is in bounds, hence
-        // `self.data.len() != 0` and `next_slot_index` index is in bounds, too.
+        // `self.data.len() != 0` and `next_slot_index` is in bounds, too.
         let next_slot_status = unsafe { self.data.get_unchecked(next_slot_index) }.status;
         let slot = unsafe { self.data.get_unchecked_mut(slot) };
         slot.status = if next_slot_status == S::FREE {
@@ -633,7 +640,7 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
 
     /// Get an immutable iterator over the entries of the table
     #[inline]
-    pub fn iter(&self) -> Iter<T, S> {
+    pub fn iter(&self) -> Iter<'_, T, S> {
         Iter {
             iter: self.data.iter(),
             len: self.len,
@@ -642,7 +649,7 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
 
     /// Get a mutable iterator over the entries of the table
     #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<T, S> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, T, S> {
         IterMut {
             iter: self.data.iter_mut(),
             len: self.len,
@@ -654,12 +661,12 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
     /// A draining iterator removes all elements from the table but does not
     /// change the table's capacity.
     ///
-    /// Note: Forgetting the returned `Drain` (e.g. via [`core::mem::forget()`])
-    /// and using the table afterwards is a very bad idea. It is not `unsafe`
-    /// but it causes correctness issues since there exist non-empty slots while
-    /// the length is already set to `0`.
+    /// Note: Forgetting the returned `Drain` (e.g., via
+    /// [`core::mem::forget()`]) and using the table afterwards is a very
+    /// bad idea. It is not `unsafe` but it causes correctness issues since
+    /// there exist non-empty slots while the length is already set to `0`.
     #[inline]
-    pub fn drain(&mut self) -> Drain<T, S> {
+    pub fn drain(&mut self) -> Drain<'_, T, S> {
         let len = self.len;
         self.len = 0;
         self.free = self.data.len();
@@ -681,6 +688,7 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
         debug_assert!(self.data.len() >= self.len);
         let mut i = self.len;
         let mut last_is_free = self.data[0].status == S::FREE;
+        // iterate from the back such that we can potentially remove tombstones
         for slot in self.data.iter_mut().rev() {
             if !slot.status.is_hash() {
                 if slot.status == S::FREE {
@@ -710,10 +718,14 @@ impl<T, S: Status, A: Clone + Allocator> RawTable<T, S, A> {
                 // status to `FREE` or `TOMBSTONE` above, so we don't duplicate
                 // the value.
                 drop(unsafe { slot.data.assume_init_read() });
+            } else {
+                last_is_free = false;
             }
             i -= 1;
             if i == 0 {
-                if self.len < self.data.len() / 4 {
+                if self.len < self.data.len() / RATIO_D * (RATIO_D - RATIO_N)
+                    && self.data.len() >= MIN_CAP
+                {
                     // shrink the table
                     self.reserve_rehash(0);
                 }
@@ -740,9 +752,9 @@ impl<T: Clone, S: Status, A: Clone + Allocator> Clone for RawTable<T, S, A> {
 impl<T, S: Status, A: Clone + Default + Allocator> Default for RawTable<T, S, A> {
     fn default() -> Self {
         RawTable {
-            #[cfg(feature = "allocator-api2")]
+            #[cfg(any(feature = "allocator-api2", feature = "nightly"))]
             data: Vec::new_in(A::default()).into_boxed_slice(),
-            #[cfg(not(feature = "allocator-api2"))]
+            #[cfg(not(any(feature = "allocator-api2", feature = "nightly")))]
             data: Vec::new().into_boxed_slice(),
             len: 0,
             free: 0,
@@ -810,14 +822,14 @@ impl<'a, T, S: Status> Iterator for Iter<'a, T, S> {
     }
 }
 
-impl<'a, T, S: Status> ExactSizeIterator for Iter<'a, T, S> {
+impl<T, S: Status> ExactSizeIterator for Iter<'_, T, S> {
     #[inline]
     fn len(&self) -> usize {
         self.len
     }
 }
 
-impl<'a, T, S: Status> FusedIterator for Iter<'a, T, S> {}
+impl<T, S: Status> FusedIterator for Iter<'_, T, S> {}
 
 // --- IterMut -----------------------------------------------------------------
 
@@ -850,14 +862,14 @@ impl<'a, T, S: Status> Iterator for IterMut<'a, T, S> {
     }
 }
 
-impl<'a, T, S: Status> ExactSizeIterator for IterMut<'a, T, S> {
+impl<T, S: Status> ExactSizeIterator for IterMut<'_, T, S> {
     #[inline]
     fn len(&self) -> usize {
         self.len
     }
 }
 
-impl<'a, T, S: Status> FusedIterator for IterMut<'a, T, S> {}
+impl<T, S: Status> FusedIterator for IterMut<'_, T, S> {}
 
 // --- IntoIter ----------------------------------------------------------------
 
@@ -920,7 +932,7 @@ impl<T, S: Status, A: Allocator> Drop for IntoIter<T, S, A> {
 
 // --- Drain -------------------------------------------------------------------
 
-impl<'a, T, S: Status> Iterator for Drain<'a, T, S> {
+impl<T, S: Status> Iterator for Drain<'_, T, S> {
     type Item = T;
 
     #[inline]
@@ -952,16 +964,16 @@ impl<'a, T, S: Status> Iterator for Drain<'a, T, S> {
     }
 }
 
-impl<'a, T, S: Status> ExactSizeIterator for Drain<'a, T, S> {
+impl<T, S: Status> ExactSizeIterator for Drain<'_, T, S> {
     #[inline]
     fn len(&self) -> usize {
         self.len
     }
 }
 
-impl<'a, T, S: Status> FusedIterator for Drain<'a, T, S> {}
+impl<T, S: Status> FusedIterator for Drain<'_, T, S> {}
 
-impl<'a, T, S: Status> Drop for Drain<'a, T, S> {
+impl<T, S: Status> Drop for Drain<'_, T, S> {
     fn drop(&mut self) {
         while self.len != 0 {
             let next = self.iter.next();
@@ -1054,7 +1066,10 @@ mod test {
         }
         assert_eq!(table.len(), 7);
 
-        table.retain(|&mut x| x % 2 == 0, |x| assert!(x % 2 == 1));
+        table.retain(
+            |&mut x| x.is_multiple_of(2),
+            |x| assert!(!x.is_multiple_of(2)),
+        );
         assert_eq!(table.len(), 3);
 
         let iter = table.drain();

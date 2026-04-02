@@ -1,7 +1,9 @@
 """OxiDD
 
 A concurrent decision diagram library.
-"""
+"""  # noqa: D400
+
+from __future__ import annotations
 
 import importlib.metadata
 

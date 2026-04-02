@@ -117,25 +117,31 @@ fn bdd_visualization() {
 - **Extensibility**: Due to OxiDD’s modular design, one can implement new kinds of decision diagrams without having to reimplement core data structures.
 - **Concurrency**: Functions represented by DDs can safely be used in multi-threaded contexts. Furthermore, apply algorithms can be executed on multiple CPU cores in parallel.
 - **Performance**: Compared to other popular BDD libraries (e.g., BuDDy, CUDD, and Sylvan), OxiDD is already competitive or even outperforms them.
+- **Visualization**: Display your DDs with ease through [OxiDD-vis](https://oxidd.net/vis).
 - **Support for Reordering**: OxiDD can reorder a decision diagram to a given variable order. Support for dynamic reordering, e.g., via sifting, is about to come.
 
 ## Getting Started
 
-Constructing a BDD for the formula (x₁ ∧ x₂) ∨ x₃ works as follows:
+Constructing a BDD for the formula (x₀ ∧ x₁) ∨ x₂ works as follows:
 
-```Rust
+```rust
 // Create a manager for up to 2048 nodes, up to 1024 apply cache entries, and
 // use 8 threads for the apply algorithms. In practice, you would choose higher
 // capacities depending on the system resources.
 let manager_ref = oxidd::bdd::new_manager(2048, 1024, 8);
-let (x1, x2, x3) = manager_ref.with_manager_exclusive(|manager| {(
-      BDDFunction::new_var(manager).unwrap(),
-      BDDFunction::new_var(manager).unwrap(),
-      BDDFunction::new_var(manager).unwrap(),
-)});
+// First, we create variables. This is done in two steps: `manager.add_vars()`
+// adds levels to the decision diagram, `BDDFunction::var()` creates the DD
+// nodes.
 // The APIs are designed such that out-of-memory situations can be handled
-// gracefully. This is the reason for the `?` operator.
-let res = x1.and(&x2)?.or(&x3)?;
+// gracefully. In principle, every operation creating nodes can fail, including
+// `BDDFunction::var()`. Hence, we call `AllocResult::from_iter()` instead of
+// `Vec::from_iter()` and have the `?` operator at the end of this statement.
+let x: Vec<BDDFunction> = manager_ref.with_manager_exclusive(|manager| {
+    AllocResult::from_iter(manager.add_vars(3).map(|i| BDDFunction::var(manager, i)))
+})?;
+// Now, we actually compute the conjunction (again with `?` for allocation error
+// handling):
+let res = x[0].and(&x[1])?.or(&x[2])?;
 println!("{}", res.satisfiable());
 ```
 
@@ -147,7 +153,7 @@ The main code is located in the [crates](crates) directory. The framework is cen
 
 ![Crate Dependency Graph](doc/book/src/img/crate-deps.svg)
 
-Besides the Rust code, there are also bindings for C/C++ and Python in the `bindings` directory. OxiDD has a foreign function interface (FFI) located in the `oxidd-ffi` crate. It does not expose the entire API that can be used from Rust, but it is sufficient to, e.g., create BDDs and apply various logical operators on them. In principle, you can use the FFI from any language that can call C functions. However, there are also more ergonomic C++ bindings that build on top of the C FFI. You can just use include this repository using CMake. To use OxiDD from Python, the easiest way is to use the package on PyPI (to be published soon).
+Besides the Rust code, there are also bindings for C/C++ and Python (located in the `bindings` directory with the corresponding Rust part in `crates/oxidd-ffi-*`). The bindings do not expose the entire API that can be used from Rust, but it is sufficient to, e.g., create BDDs and apply various logical operators on them. In principle, you can use the C FFI from any language that can call C functions. However, there are also more ergonomic C++ bindings built on top of the C FFI. To use them, you can just use include this repository using CMake. For Python, the easiest way is to use the package on [PyPI](https://pypi.org/project/oxidd/).
 
 ## FAQ
 
@@ -169,7 +175,7 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 The [seminal paper](https://doi.org/10.1007/978-3-031-57256-2_13) presenting OxiDD was published at TACAS'24. If you use OxiDD, please cite us as:
 
-Nils Husung, Clemens Dubslaff, Holger Hermanns, and Maximilian A. Köhl: _OxiDD: A safe, concurrent, modular, and performant decision diagram framework in Rust._ In: Proceedings of the 30th International Conference on Tools and Algorithms for the Construction and Analysis of Systems (TACAS’24) (accepted for publication 2024)
+Nils Husung, Clemens Dubslaff, Holger Hermanns, and Maximilian A. Köhl: _OxiDD: A safe, concurrent, modular, and performant decision diagram framework in Rust._ In: Proceedings of the 30th International Conference on Tools and Algorithms for the Construction and Analysis of Systems (TACAS’24)
 
     @inproceedings{oxidd24,
       author        = {Husung, Nils and Dubslaff, Clemens and Hermanns, Holger and K{\"o}hl, Maximilian A.},

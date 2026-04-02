@@ -1,5 +1,5 @@
 use oxidd_core::util::{AllocResult, Borrowed, EdgeDropGuard};
-use oxidd_core::{LevelNo, Manager, WorkerManager};
+use oxidd_core::{LevelNo, Manager, VarNo};
 
 type BinaryOp<M, R> = fn(
     &M,
@@ -16,13 +16,8 @@ type TernaryOp<M, R> = fn(
     Borrowed<<M as Manager>::Edge>,
 ) -> AllocResult<<M as Manager>::Edge>;
 
-type SubsetOp<M, R> = fn(
-    &M,
-    R,
-    Borrowed<<M as Manager>::Edge>,
-    Borrowed<<M as Manager>::Edge>,
-    LevelNo,
-) -> AllocResult<<M as Manager>::Edge>;
+type SubsetOp<M, R> =
+    fn(&M, R, Borrowed<<M as Manager>::Edge>, VarNo, LevelNo) -> AllocResult<<M as Manager>::Edge>;
 
 pub trait Recursor<M: Manager>: Copy {
     fn binary<'a>(
@@ -56,16 +51,17 @@ pub trait Recursor<M: Manager>: Copy {
         self,
         op: SubsetOp<M, Self>,
         manager: &'a M,
-        a: (Borrowed<M::Edge>, Borrowed<M::Edge>, LevelNo),
-        b: (Borrowed<M::Edge>, Borrowed<M::Edge>, LevelNo),
+        a: (Borrowed<M::Edge>, VarNo, LevelNo),
+        b: (Borrowed<M::Edge>, VarNo, LevelNo),
     ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)>;
 
     /// Returns true if the algorithm should switch to a sequential recursor
     ///
-    /// With the current [`join()`][WorkerManager::join] implementations, we
-    /// observe a significant performance overhead compared to sequentially
-    /// calling the functions. Therefore, it may make sense to switch to the
-    /// sequential version after, e.g., a certain recursion depth.
+    /// With the current [`join()`][oxidd_core::WorkerPool::join]
+    /// implementations, we observe a significant performance overhead
+    /// compared to sequentially calling the functions. Therefore, it may
+    /// make sense to switch to the sequential version after, e.g., a
+    /// certain recursion depth.
     fn should_switch_to_sequential(self) -> bool;
 }
 
@@ -118,8 +114,8 @@ impl<M: Manager> Recursor<M> for SequentialRecursor {
         self,
         op: SubsetOp<M, Self>,
         manager: &'a M,
-        a: (Borrowed<M::Edge>, Borrowed<M::Edge>, LevelNo),
-        b: (Borrowed<M::Edge>, Borrowed<M::Edge>, LevelNo),
+        a: (Borrowed<M::Edge>, VarNo, LevelNo),
+        b: (Borrowed<M::Edge>, VarNo, LevelNo),
     ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
         let ra = EdgeDropGuard::new(manager, op(manager, self, a.0, a.1, a.2)?);
         let rb = EdgeDropGuard::new(manager, op(manager, self, b.0, b.1, b.2)?);
@@ -135,6 +131,7 @@ impl<M: Manager> Recursor<M> for SequentialRecursor {
 #[cfg(feature = "multi-threading")]
 pub mod mt {
     use super::*;
+    use oxidd_core::WorkerPool;
 
     #[derive(Clone, Copy)]
     pub struct ParallelRecursor {
@@ -142,16 +139,16 @@ pub mod mt {
     }
 
     impl ParallelRecursor {
-        pub fn new<M: WorkerManager>(manager: &M) -> Self {
+        pub fn new<M: oxidd_core::HasWorkers>(manager: &M) -> Self {
             Self {
-                remaining_depth: manager.split_depth(),
+                remaining_depth: manager.workers().split_depth(),
             }
         }
     }
 
     impl<M> Recursor<M> for ParallelRecursor
     where
-        M: Manager + WorkerManager,
+        M: Manager + oxidd_core::HasWorkers,
         M::Edge: Send + Sync,
     {
         fn binary<'a>(
@@ -162,7 +159,7 @@ pub mod mt {
             b: (Borrowed<M::Edge>, Borrowed<M::Edge>),
         ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
             self.remaining_depth -= 1;
-            let (ra, rb) = manager.join(
+            let (ra, rb) = manager.workers().join(
                 move || {
                     let edge = op(manager, self, a.0, a.1)?;
                     Ok(EdgeDropGuard::new(manager, edge))
@@ -183,7 +180,7 @@ pub mod mt {
             b: (Borrowed<M::Edge>, Borrowed<M::Edge>, Borrowed<M::Edge>),
         ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
             self.remaining_depth -= 1;
-            let (ra, rb) = manager.join(
+            let (ra, rb) = manager.workers().join(
                 move || {
                     let edge = op(manager, self, a.0, a.1, a.2)?;
                     Ok(EdgeDropGuard::new(manager, edge))
@@ -206,7 +203,7 @@ pub mod mt {
             b: (Borrowed<M::Edge>, Borrowed<M::Edge>, Borrowed<M::Edge>),
         ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
             self.remaining_depth -= 1;
-            let (ra, rb) = manager.join(
+            let (ra, rb) = manager.workers().join(
                 move || {
                     let edge = op_a(manager, self, a.0, a.1)?;
                     Ok(EdgeDropGuard::new(manager, edge))
@@ -223,11 +220,11 @@ pub mod mt {
             mut self,
             op: SubsetOp<M, Self>,
             manager: &'a M,
-            a: (Borrowed<M::Edge>, Borrowed<M::Edge>, LevelNo),
-            b: (Borrowed<M::Edge>, Borrowed<M::Edge>, LevelNo),
+            a: (Borrowed<M::Edge>, VarNo, LevelNo),
+            b: (Borrowed<M::Edge>, VarNo, LevelNo),
         ) -> AllocResult<(EdgeDropGuard<'a, M>, EdgeDropGuard<'a, M>)> {
             self.remaining_depth -= 1;
-            let (ra, rb) = manager.join(
+            let (ra, rb) = manager.workers().join(
                 move || {
                     let edge = op(manager, self, a.0, a.1, a.2)?;
                     Ok(EdgeDropGuard::new(manager, edge))

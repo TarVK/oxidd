@@ -8,7 +8,6 @@ use std::marker::PhantomData;
 use oxidd_core::util::{AllocResult, Borrowed, EdgeDropGuard};
 use oxidd_core::{DiagramRules, Edge, HasLevel, InnerNode, LevelNo, Manager, Node, ReducedOrNew};
 use oxidd_derive::Countable;
-use oxidd_dump::dddmp::AsciiDisplay;
 
 use crate::stat;
 
@@ -65,7 +64,7 @@ fn not_owned<E: Edge<Tag = EdgeTag>>(e: E) -> E {
 
 #[inline]
 #[must_use]
-fn not<E: Edge<Tag = EdgeTag>>(e: &E) -> Borrowed<E> {
+fn not<E: Edge<Tag = EdgeTag>>(e: &E) -> Borrowed<'_, E> {
     let tag = e.tag();
     e.with_tag(!tag)
 }
@@ -76,10 +75,13 @@ fn not<E: Edge<Tag = EdgeTag>>(e: &E) -> Borrowed<E> {
 pub struct BCDDRules;
 
 impl<E: Edge<Tag = EdgeTag>, N: InnerNode<E>> DiagramRules<E, N, BCDDTerminal> for BCDDRules {
-    type Cofactors<'a> = Cofactors<'a, E, N::ChildrenIter<'a>> where N: 'a, E: 'a;
+    type Cofactors<'a>
+        = Cofactors<'a, E, N::ChildrenIter<'a>>
+    where
+        N: 'a,
+        E: 'a;
 
     #[inline]
-    #[must_use]
     fn reduce<M: Manager<Edge = E, InnerNode = N>>(
         manager: &M,
         level: LevelNo,
@@ -110,7 +112,6 @@ impl<E: Edge<Tag = EdgeTag>, N: InnerNode<E>> DiagramRules<E, N, BCDDTerminal> f
     }
 
     #[inline]
-    #[must_use]
     fn cofactors(tag: E::Tag, node: &N) -> Self::Cofactors<'_> {
         Cofactors {
             it: node.children(),
@@ -120,7 +121,7 @@ impl<E: Edge<Tag = EdgeTag>, N: InnerNode<E>> DiagramRules<E, N, BCDDTerminal> f
     }
 
     #[inline]
-    fn cofactor(tag: E::Tag, node: &N, n: usize) -> Borrowed<E> {
+    fn cofactor(tag: E::Tag, node: &N, n: usize) -> Borrowed<'_, E> {
         let e = node.child(n);
         if tag == EdgeTag::None {
             e
@@ -189,7 +190,7 @@ fn is_false<M: Manager<EdgeTag = EdgeTag>>(manager: &M, edge: &M::Edge) -> bool 
 fn collect_cofactors<E: Edge<Tag = EdgeTag>, N: InnerNode<E>>(
     tag: EdgeTag,
     node: &N,
-) -> (Borrowed<E>, Borrowed<E>) {
+) -> (Borrowed<'_, E>, Borrowed<'_, E>) {
     debug_assert_eq!(N::ARITY, 2);
     let mut it = BCDDRules::cofactors(tag, node);
     let ft = it.next().unwrap();
@@ -205,16 +206,32 @@ fn reduce<M>(
     level: LevelNo,
     t: M::Edge,
     e: M::Edge,
-    _op: BCDDOp,
+    op: BCDDOp,
 ) -> AllocResult<M::Edge>
 where
     M: Manager<Terminal = BCDDTerminal, EdgeTag = EdgeTag>,
 {
-    let tmp = <BCDDRules as DiagramRules<_, _, _>>::reduce(manager, level, [t, e]);
-    if let ReducedOrNew::Reduced(..) = &tmp {
-        stat!(reduced _op);
+    // We do not use `DiagramRules::reduce()` here, as the iterator is
+    // apparently not fully optimized away.
+    if t == e {
+        stat!(reduced op);
+        manager.drop_edge(e);
+        return Ok(t);
     }
-    tmp.then_insert(manager, level)
+
+    let tt = t.tag();
+    let (node, tag) = if tt == EdgeTag::Complemented {
+        let et = e.tag();
+        let node = M::InnerNode::new(
+            level,
+            [t.with_tag_owned(EdgeTag::None), e.with_tag_owned(!et)],
+        );
+        (node, EdgeTag::Complemented)
+    } else {
+        (M::InnerNode::new(level, [t, e]), EdgeTag::None)
+    };
+
+    Ok(oxidd_core::LevelView::get_or_insert(&mut manager.level(level), node)?.with_tag_owned(tag))
 }
 
 // --- Terminal Type -----------------------------------------------------------
@@ -223,15 +240,18 @@ where
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Countable, Debug)]
 pub struct BCDDTerminal;
 
-impl std::str::FromStr for BCDDTerminal {
-    type Err = std::convert::Infallible;
-
-    fn from_str(_s: &str) -> Result<Self, Self::Err> {
-        Ok(BCDDTerminal)
+impl oxidd_dump::ParseTagged<EdgeTag> for BCDDTerminal {
+    fn parse(s: &str) -> Option<(Self, EdgeTag)> {
+        let tag = match s {
+            "t" | "T" | "true" | "True" | "TRUE" | "⊤" | "1" => EdgeTag::None,
+            "f" | "F" | "false" | "False" | "FALSE" | "⊥" | "0" => EdgeTag::Complemented,
+            _ => return None,
+        };
+        Some((BCDDTerminal, tag))
     }
 }
 
-impl AsciiDisplay for BCDDTerminal {
+impl oxidd_dump::AsciiDisplay for BCDDTerminal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         f.write_str("T")
     }
@@ -354,7 +374,7 @@ pub enum BCDDOp {
     /// Forall quantification
     Forall,
     /// Existential quantification
-    Exist,
+    Exists,
     /// Unique quantification
     Unique,
 
@@ -379,7 +399,7 @@ impl BCDDOp {
                 _ if op == BCDDOp::Xor as u8 => BCDDOp::ForallXor,
                 _ => panic!("invalid OP"),
             }
-        } else if q == BCDDOp::Exist as u8 {
+        } else if q == BCDDOp::Exists as u8 {
             match () {
                 _ if op == BCDDOp::And as u8 => BCDDOp::ExistAnd,
                 _ if op == BCDDOp::Xor as u8 => BCDDOp::ExistXor,
@@ -415,33 +435,6 @@ pub fn print_stats() {
 }
 
 // --- Utility Functions -------------------------------------------------------
-
-#[inline]
-fn is_var<M>(manager: &M, node: &M::InnerNode) -> bool
-where
-    M: Manager<Terminal = BCDDTerminal, EdgeTag = EdgeTag>,
-{
-    let t = node.child(0);
-    let e = node.child(1);
-    t.tag() == EdgeTag::None
-        && e.tag() == EdgeTag::Complemented
-        && manager.get_node(&t).is_any_terminal()
-        && manager.get_node(&e).is_any_terminal()
-}
-
-#[inline]
-#[track_caller]
-fn var_level<M>(manager: &M, e: Borrowed<M::Edge>) -> LevelNo
-where
-    M: Manager<Terminal = BCDDTerminal, EdgeTag = EdgeTag>,
-    M::InnerNode: HasLevel,
-{
-    let node = manager
-        .get_node(&e)
-        .expect_inner("Expected a variable but got a terminal node");
-    debug_assert!(is_var(manager, node));
-    node.level()
-}
 
 /// Add a literal for the variable at `level` to the cube `sub`. The literal
 /// has positive polarity iff `positive` is true. `level` must be above (less

@@ -9,11 +9,27 @@
 // achieve this, we use assertions that evaluate to `true` on usual targets.
 #![allow(clippy::assertions_on_constants)]
 
+use std::fmt;
+
+/// Like [`std::fmt::Display`], but the format should use ASCII characters only
+pub trait AsciiDisplay {
+    /// Format the value with the given formatter
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error>;
+}
+
+/// Parse a value from a string, along with a tag
+pub trait ParseTagged<Tag>: Sized {
+    /// Parse the string `s`
+    fn parse(s: &str) -> Option<(Self, Tag)>;
+}
+
 #[cfg(feature = "dddmp")]
 pub mod dddmp;
 
-#[cfg(feature = "dot")]
+// No feature gate here to always have the traits
 pub mod dot;
 
 #[cfg(feature = "visualize")]
-pub mod visualize;
+mod visualize;
+#[cfg(feature = "visualize")]
+pub use visualize::{VisualizationListener, Visualizer};

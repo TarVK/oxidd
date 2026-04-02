@@ -3,16 +3,12 @@
 pub(crate) mod apply_cache;
 pub(crate) mod type_cons;
 
-pub use oxidd_core::util::num;
-pub use oxidd_core::util::AllocResult;
-pub use oxidd_core::util::Borrowed;
-pub use oxidd_core::util::IsFloatingPoint;
-pub use oxidd_core::util::OptBool;
-pub use oxidd_core::util::OutOfMemory;
-pub use oxidd_core::util::Rng;
-pub use oxidd_core::util::SatCountCache;
-pub use oxidd_core::util::SatCountNumber;
 pub use rustc_hash::FxHasher;
+
+pub use oxidd_core::error::OutOfMemory;
+pub use oxidd_core::util::{
+    num, AllocResult, Borrowed, IsFloatingPoint, OptBool, Rng, SatCountCache, SatCountNumber,
+};
 
 // We have a few `allow(unused)` attributes here to not spam the user with
 // warnings in case no manager implementation is selected.
@@ -20,6 +16,8 @@ pub use rustc_hash::FxHasher;
 #[allow(unused)]
 macro_rules! manager_data {
     ($name:ident$(<$($gen:ident),*>)? for $dd:ident$(<$($dd_gen:ident),*>)?, operator: $op:ty, cache_max_arity: $arity:expr $(, where $($where:tt)*)?) => {
+        #[derive(::oxidd_derive::ManagerEventSubscriber)]
+        #[subscribe(manager = <$dd$(<$($dd_gen),*>)? as $crate::util::type_cons::DD>::Manager<'id>, no_trait_bounds)]
         pub struct $name<'id, $($($gen),*)?> $(where $($where)*)? {
             apply_cache: $crate::util::apply_cache::ApplyCache<
                 <$dd$(<$($dd_gen),*>)? as $crate::util::type_cons::DD>::Manager<'id>,
@@ -31,8 +29,8 @@ macro_rules! manager_data {
         impl<'id, $($($gen),*)?> $name<'id, $($($gen),*)?> $(where $($where)*)? {
             /// SAFETY: The manager data must only be used inside a manager that
             /// guarantees all node deletions to be wrapped inside a
-            /// [`oxidd_core::util::GCContainer::pre_gc()`] /
-            /// [`oxidd_core::util::GCContainer::post_gc()`]
+            /// [`oxidd_core::ManagerEventSubscriber::pre_gc()`] /
+            /// [`oxidd_core::ManagerEventSubscriber::post_gc()`]
             /// pair for the contained apply cache.
             unsafe fn new(apply_cache_capacity: usize) -> Self {
                 Self {
@@ -52,20 +50,6 @@ macro_rules! manager_data {
                 drop_edge: impl Fn(<$dd$(<$($dd_gen),*>)? as $crate::util::type_cons::DD>::Edge<'id>),
             ) {
                 self.apply_cache.drop_with(drop_edge)
-            }
-        }
-
-        impl<'id, $($($gen),*)?> ::oxidd_core::util::GCContainer<<$dd$(<$($dd_gen),*>)? as $crate::util::type_cons::DD>::Manager<'id>>
-            for $name<'id, $($($gen),*)?> $(where $($where)*)?
-        {
-            #[inline]
-            fn pre_gc(&self, manager: &<$dd$(<$($dd_gen),*>)? as $crate::util::type_cons::DD>::Manager<'id>) {
-                self.apply_cache.pre_gc(manager)
-            }
-            #[inline]
-            unsafe fn post_gc(&self, manager: &<$dd$(<$($dd_gen),*>)? as $crate::util::type_cons::DD>::Manager<'id>) {
-                // SAFETY: inherited from outer
-                unsafe { self.apply_cache.post_gc(manager) }
             }
         }
 
@@ -228,6 +212,16 @@ macro_rules! manager_ref_index_based {
             }
         }
 
+
+        impl$(<$($gen),*>)? $crate::HasWorkers for $name$(<$($gen),*>)? $(where $($where)*)? {
+            type WorkerPool = <$inner as $crate::HasWorkers>::WorkerPool;
+
+            #[inline]
+            fn workers(&self) -> &Self::WorkerPool {
+                self.0.workers()
+            }
+        }
+
         impl$(<$($gen),*>)? $name$(<$($gen),*>)? $(where $($where)*)? {
             /// Create a new manager instance
             ///
@@ -309,6 +303,15 @@ macro_rules! manager_ref_pointer_based {
             unsafe fn from_raw(raw: *const std::ffi::c_void) -> Self {
                 // SAFETY: Invariants are upheld by the caller.
                 Self(unsafe { ::oxidd_manager_pointer::manager::ManagerRef::from_raw(raw) })
+            }
+        }
+
+        impl $crate::HasWorkers for $name {
+            type WorkerPool = <$inner as $crate::HasWorkers>::WorkerPool;
+
+            #[inline]
+            fn workers(&self) -> &Self::WorkerPool {
+                self.0.workers()
             }
         }
 

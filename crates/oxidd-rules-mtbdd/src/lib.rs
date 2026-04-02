@@ -26,10 +26,13 @@ mod apply_rec;
 pub struct MTBDDRules;
 
 impl<E: Edge, N: InnerNode<E>, T> DiagramRules<E, N, T> for MTBDDRules {
-    type Cofactors<'a> = N::ChildrenIter<'a> where N: 'a, E: 'a;
+    type Cofactors<'a>
+        = N::ChildrenIter<'a>
+    where
+        N: 'a,
+        E: 'a;
 
     #[inline]
-    #[must_use]
     fn reduce<M: Manager<Edge = E, InnerNode = N, Terminal = T>>(
         manager: &M,
         level: LevelNo,
@@ -49,7 +52,6 @@ impl<E: Edge, N: InnerNode<E>, T> DiagramRules<E, N, T> for MTBDDRules {
     }
 
     #[inline]
-    #[must_use]
     fn cofactors(_tag: E::Tag, node: &N) -> Self::Cofactors<'_> {
         node.children()
     }
@@ -92,7 +94,7 @@ pub enum MTBDDOp {
 /// Collect the two children of a binary node
 #[inline]
 #[must_use]
-fn collect_children<E: Edge, N: InnerNode<E>>(node: &N) -> (Borrowed<E>, Borrowed<E>) {
+fn collect_children<E: Edge, N: InnerNode<E>>(node: &N) -> (Borrowed<'_, E>, Borrowed<'_, E>) {
     debug_assert_eq!(N::ARITY, 2);
     let mut it = node.children();
     let t = it.next().unwrap();

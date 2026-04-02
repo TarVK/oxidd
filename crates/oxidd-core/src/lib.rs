@@ -22,14 +22,14 @@
 
 use std::borrow::Borrow;
 use std::hash::Hash;
+use std::ops::Range;
 
-use util::AllocResult;
-use util::Borrowed;
-use util::DropWith;
-use util::NodeSet;
-
+pub mod error;
 pub mod function;
 pub mod util;
+
+use error::DuplicateVarName;
+use util::{AllocResult, Borrowed, DropWith, NodeSet};
 
 /// Manager reference
 ///
@@ -141,7 +141,7 @@ pub trait DiagramRules<E: Edge, N: InnerNode<E>, T> {
     ///
     /// This is equivalent to `Self::cofactors(tag, node).nth(n).unwrap()`.
     #[inline]
-    fn cofactor(tag: E::Tag, node: &N, n: usize) -> Borrowed<E> {
+    fn cofactor(tag: E::Tag, node: &N, n: usize) -> Borrowed<'_, E> {
         Self::cofactors(tag, node).nth(n).expect("out of range")
     }
 }
@@ -230,12 +230,16 @@ pub trait InnerNode<E: Edge>: Sized + Eq + Hash + DropWith<E> {
     /// number and want to get the level number.
     fn check_level(&self, check: impl FnOnce(LevelNo) -> bool) -> bool;
 
+    /// Panics if the node types stores a level and the node's level is not
+    /// `level`
+    fn assert_level_matches(&self, level: LevelNo);
+
     /// Get the children of this node as an iterator
     #[must_use]
     fn children(&self) -> Self::ChildrenIter<'_>;
 
     /// Get the `n`-th child of this node
-    fn child(&self, n: usize) -> Borrowed<E>;
+    fn child(&self, n: usize) -> Borrowed<'_, E>;
 
     /// Set the `n`-th child of this node
     ///
@@ -278,6 +282,12 @@ pub type LevelNo = u32;
 /// Atomic version of [`LevelNo`]
 pub type AtomicLevelNo = std::sync::atomic::AtomicU32;
 
+/// Variable number type
+pub type VarNo = LevelNo;
+
+/// Atomic version of [`VarNo`]
+pub type AtomicVarNo = AtomicLevelNo;
+
 /// Trait for nodes that have a level
 ///
 /// Quasi-reduced BDDs, for instance, do not need the level information stored
@@ -293,7 +303,8 @@ pub type AtomicLevelNo = std::sync::atomic::AtomicU32;
 /// 1. A node in a [`LevelView`] with level number L has level number L (i.e.
 ///    `self.level()` returns L).
 /// 2. [`InnerNode::check_level()`] with a check `c` must return
-///    `c(self.level())`.
+///    `c(self.level())`. Similarly, [`InnerNode::assert_level_matches()`] must
+///    panic if the level does not match.
 ///
 /// These conditions are crucial to enable concurrent level swaps as part of
 /// reordering (see the `oxidd-reorder` crate): The algorithm iterates over the
@@ -358,12 +369,12 @@ pub trait Edge: Sized + Ord + Hash {
     type Tag: Tag;
 
     /// Turn a reference into a borrowed handle
-    fn borrowed(&self) -> Borrowed<Self>;
+    fn borrowed(&self) -> Borrowed<'_, Self>;
     /// Get a version of this [`Edge`] with the given tag
     ///
     /// Refer to [`Borrowed::edge_with_tag()`] for cases in which this method
     /// cannot be used due to lifetime restrictions.
-    fn with_tag(&self, tag: Self::Tag) -> Borrowed<Self>;
+    fn with_tag(&self, tag: Self::Tag) -> Borrowed<'_, Self>;
     /// Get a version of this [`Edge`] with the given tag
     fn with_tag_owned(self, tag: Self::Tag) -> Self;
 
@@ -605,14 +616,6 @@ impl<'a, M: Manager> Node<'a, M> {
 /// Every level view is associated with a manager and a level number.
 /// [`Manager::level()`] must always return the level view associated to this
 /// manager with the given level number.
-///
-/// If [`Manager::InnerNode`] implements [`HasLevel`], then the implementation
-/// must ensure that [`HasLevel::level()`] returns level number L for all nodes
-/// at the level view for L. Specifically this means that
-/// [`Manager::add_level()`] must check the newly created node. The invariant
-/// may only be broken by unsafe code (e.g. via [`HasLevel::set_level()`] and
-/// [`LevelView::swap()`]) and must be re-established when leaving the unsafe
-/// scope (be aware of panics!).
 pub unsafe trait Manager: Sized {
     /// Type of edge
     type Edge: Edge<Tag = Self::EdgeTag>;
@@ -657,7 +660,7 @@ pub unsafe trait Manager: Sized {
 
     /// Get a reference to the node to which `edge` points
     #[must_use]
-    fn get_node(&self, edge: &Self::Edge) -> Node<Self>;
+    fn get_node(&self, edge: &Self::Edge) -> Node<'_, Self>;
 
     /// Clone `edge`
     #[must_use]
@@ -665,6 +668,25 @@ pub unsafe trait Manager: Sized {
 
     /// Drop `edge`
     fn drop_edge(&self, edge: Self::Edge);
+    /// Drop `edge` and try to remove the node it points to
+    ///
+    /// `level` is the node's level. This is required because nodes do not
+    /// necessarily store their level, but the lookup in a unique table split by
+    /// levels needs the level.
+    ///
+    /// Returns whether the node has been removed. There are multiple reasons
+    /// why removing the node can fail. Obviously, it could still be referenced
+    /// by other edges. It might also be that removing nodes is currently not
+    /// possible, e.g., because the manager is not prepared for it. Also, if
+    /// `level` does not match the node's actual level, the node referenced by
+    /// `edge` may not be removed. In this case, the method might even remove
+    /// another node with the same children which is only referenced from the
+    /// unique table.
+    ///
+    /// Passing the wrong `level` is considered to be a programming mistake. To
+    /// aid debugging, the implementation is allowed (but not required) to panic
+    /// if it can diagnose such a mistake.
+    fn try_remove_node(&self, edge: Self::Edge, level: LevelNo) -> bool;
 
     /// Get the count of inner nodes
     #[must_use]
@@ -680,20 +702,107 @@ pub unsafe trait Manager: Sized {
         self.num_inner_nodes()
     }
 
+    /// Get the number of variables
+    ///
+    /// Same as [`Self::num_levels()`]
+    #[must_use]
+    #[inline(always)]
+    fn num_vars(&self) -> VarNo {
+        self.num_levels()
+    }
+
     /// Get the number of levels
+    ///
+    /// Same as [`Self::num_vars()`]
     #[must_use]
     fn num_levels(&self) -> LevelNo;
 
-    /// Add a level with the given node to the unique table.
-    ///
-    /// To avoid unnecessary (un-)locking, this function takes a closure `f`
-    /// that creates a first node for the new level.
-    ///
-    /// Returns an edge for the newly created node.
-    ///
-    /// Panics if the new node's level does not match the provided level.
+    /// Get the number of named variables
     #[must_use]
-    fn add_level(&mut self, f: impl FnOnce(LevelNo) -> Self::InnerNode) -> AllocResult<Self::Edge>;
+    fn num_named_vars(&self) -> VarNo;
+
+    /// Add `additional` unnamed variables to the decision diagram
+    ///
+    /// The new variables are added at the bottom of the variable order. More
+    /// precisely, the level number equals the variable number for each new
+    /// variable.
+    ///
+    /// Note that some algorithms may assume that the domain of a function
+    /// represented by a decision diagram is just the set of all variables. In
+    /// this regard, adding variables can change the semantics of decision
+    /// diagram nodes.
+    ///
+    /// Returns the range of new variable numbers.
+    ///
+    /// Panics if [`self.num_vars()`][Self::num_vars()] plus `additional` is
+    /// greater than to [`VarNo::MAX`].
+    fn add_vars(&mut self, additional: VarNo) -> Range<VarNo>;
+
+    /// Add named variables to the decision diagram
+    ///
+    /// This is a shorthand for [`Self::add_vars()`] and respective
+    /// [`Self::set_var_name()`] calls. More details can be found there.
+    ///
+    /// Returns the range of new variable numbers on success. In case a name
+    /// is not unique (and not `""`), only the first variables with unique names
+    /// are added, and a [`DuplicateVarName`] error provides more details.
+    ///
+    /// Panics if there would be more than [`VarNo::MAX`] variables after adding
+    /// the ones from `names`.
+    fn add_named_vars<S: Into<String>>(
+        &mut self,
+        names: impl IntoIterator<Item = S>,
+    ) -> Result<Range<VarNo>, DuplicateVarName>;
+
+    /// Add named variables to the decision diagram
+    ///
+    /// This is a possibly specialized version of [`Self::add_named_vars()`].
+    ///
+    /// Panics if there would be more than [`VarNo::MAX`] variables after adding
+    /// the ones from `names`.
+    fn add_named_vars_from_map(
+        &mut self,
+        map: crate::util::VarNameMap,
+    ) -> Result<Range<VarNo>, DuplicateVarName> {
+        self.add_named_vars(map.into_names_iter())
+    }
+
+    /// Get `var`'s name
+    ///
+    /// For unnamed variables, this will return the empty string.
+    ///
+    /// Panics if `var` is greater or equal to the number of variables in this
+    /// manager.
+    fn var_name(&self, var: VarNo) -> &str;
+
+    /// Label `var` as `name`
+    ///
+    /// An empty name means that the variable will become unnamed, and cannot be
+    /// retrieved via [`Self::name_to_var()`] anymore.
+    ///
+    /// Returns a [`DuplicateVarName`] error if `name` is not unique (and not
+    /// `""`).
+    ///
+    /// Panics if `var` is greater or equal to the number of variables in this
+    /// manager.
+    fn set_var_name(&mut self, var: VarNo, name: impl Into<String>)
+        -> Result<(), DuplicateVarName>;
+
+    /// Get the variable number for the given variable name, if present
+    ///
+    /// Note that you cannot retrieve unnamed variables.
+    /// `manager.name_to_var("")` always returns `None`.
+    fn name_to_var(&self, name: impl AsRef<str>) -> Option<VarNo>;
+
+    /// Get the level for the given variable
+    ///
+    /// Panics if `level >= self.num_vars()`.
+    fn var_to_level(&self, var: VarNo) -> LevelNo;
+
+    /// Get the variable for the given level
+    ///
+    /// Panics if `level >= self.num_levels()`.
+    fn level_to_var(&self, level: LevelNo) -> VarNo;
 
     /// Get the level given by `no`
     ///
@@ -743,19 +852,161 @@ pub unsafe trait Manager: Sized {
     /// nodes that can be removed, this node will be removed as well.
     ///
     /// Returns the number of nodes removed.
+    ///
+    /// The implementation should emit the [`ManagerEventSubscriber::pre_gc()`]
+    /// and [`ManagerEventSubscriber::post_gc()`] events unless called from the
+    /// closure passed to [`Self::reorder()`].
     fn gc(&self) -> usize;
 
     /// Prepare and postprocess a reordering operation. The reordering itself is
     /// performed in `f`.
     ///
     /// Returns the value returned by `f`.
+    ///
+    /// In case of a recursive call (i.e., the closure passed to this method
+    /// calls this method again), the implementation should just call `f` and
+    /// return.
+    ///
+    /// Otherwise, the implementation should emit
+    /// [events][ManagerEventSubscriber] in the following order:
+    ///
+    /// 1. [`pre_gc`][ManagerEventSubscriber::pre_gc()]. This enables node
+    ///    removal during the `pre_reorder` events.
+    /// 2. [`pre_reorder`][ManagerEventSubscriber::pre_reorder()] and
+    ///    [`pre_reorder_mut`][ManagerEventSubscriber::pre_reorder_mut()]
+    /// 3. Call `f`
+    /// 4. [`post_reorder`][ManagerEventSubscriber::post_reorder()] and
+    ///    [`post_reorder_mut`][ManagerEventSubscriber::post_reorder_mut()]
+    /// 5. [`post_gc`][ManagerEventSubscriber::post_gc()]
     fn reorder<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T;
+
+    /// Get the count of garbage collections
+    ///
+    /// This counter should monotonically increase to ensure that caches are
+    /// invalidated accordingly.
+    fn gc_count(&self) -> u64;
 
     /// Get the count of reordering operations
     ///
     /// This counter should monotonically increase to ensure that caches are
     /// invalidated accordingly.
     fn reorder_count(&self) -> u64;
+}
+
+/// Event subscriber for [`Manager`]-related events
+///
+/// This is intended to be implemented by data structures that can be plugged
+/// into the [`Manager`], e.g., an [`ApplyCache`] implementation.
+///
+/// # Use Cases
+///
+/// When using reference counting to implement garbage collection of dead nodes,
+/// cloning and dropping edges when inserting entries into the apply cache may
+/// cause many CPU cache misses. To circumvent this performance issue, the apply
+/// cache may store [`Borrowed<M::Edge>`]s (e.g., using the unsafe
+/// [`Borrowed::into_inner()`]). Now, the apply cache implementation has to
+/// guarantee that every edge returned by the [`get()`][ApplyCache::get]
+/// method still points to a valid node. To that end, the cache may, e.g., clear
+/// itself when [`Self::pre_gc()`] is called and reject any insertion of new
+/// entries until [`Self::post_gc()`].
+///
+/// # Safety
+///
+/// A use-case such as the one described above requires the `pre_*` methods to
+/// actually be called before any garbage collection / reordering for SAFETY.
+/// This means the struct implementing `ManagerEventSubscriber` must only be
+/// plugged into [`Manager`] implementations or other wrapper structures that
+/// uphold this contract, i.e., creation of the `ManagerEventSubscriber`
+/// implementation must be `unsafe`.
+///
+/// Additionally, we require each [`post_gc`][Self::post_gc] call to be paired
+/// with a distinct preceding [`pre_gc`][Self::pre_gc] call, see below.
+pub trait ManagerEventSubscriber<M: Manager> {
+    /// Initialization
+    ///
+    /// This method is called once at the very end of initializing a new
+    /// manager.
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn init(&self, manager: &M) {}
+
+    /// Initialization
+    ///
+    /// This is an alternative to [`Self::post_reorder()`] with a mutable
+    /// reference to the manager as an argument. Since `self` may be a
+    /// substructure of `manager`, the method cannot provide mutable references
+    /// to both `self` and `manager`.
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn init_mut(manager: &mut M) {}
+
+    /// Prepare a garbage collection
+    ///
+    /// The [`Manager`] implementation should only remove nodes (as part of a
+    /// garbage collection or reordering) after calling this method. Between a
+    /// `pre_gc` and the subsequent [`post_gc`][Self::post_gc] call, there
+    /// should not be another `pre_gc` call.
+    ///
+    /// This method may lock (parts of) `self`. Unlocking is then done in
+    /// [`Self::post_gc()`].
+    ///
+    /// Note that this method and [`Self::pre_reorder`] may both be called in
+    /// case of reordering, but can also be
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn pre_gc(&self, manager: &M) {}
+
+    /// Post-process a garbage collection
+    ///
+    /// # Safety
+    ///
+    /// Each call to this method must be paired with a distinct preceding
+    /// [`Self::pre_gc()`] call. All operations potentially removing nodes must
+    /// happen between such a pair of method calls.
+    #[inline(always)]
+    #[allow(unused_variables)]
+    unsafe fn post_gc(&self, manager: &M) {}
+
+    /// Prepare a reordering operation (including any addition of levels)
+    ///
+    /// The [`Manager`] implementation should only add or reorder levels after
+    /// calling this method and [`pre_reorder_mut`][Self::pre_reorder_mut].
+    /// Between a `pre_reorder` and the subsequent
+    /// [`post_reorder`][Self::post_reorder] call, there should not be
+    /// another `pre_reorder` call.
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn pre_reorder(&self, manager: &M) {}
+
+    /// Prepare a reordering operation (including any addition of levels)
+    ///
+    /// This is an alternative to [`Self::pre_reorder()`] with a mutable
+    /// reference to the manager as an argument. Since `self` may be a
+    /// substructure of `manager`, the method cannot provide mutable references
+    /// to both `self` and `manager`.
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn pre_reorder_mut(manager: &mut M) {}
+
+    /// Post-process a reordering operation
+    ///
+    /// Each call to this method should be paired with a distinct preceding
+    /// [`Self::pre_reorder()`] call. All operations reordering (or adding)
+    /// levels of the decision diagram should happen between such a pair of
+    /// method calls.
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn post_reorder(&self, manager: &M) {}
+
+    /// Post-process a reordering operation
+    ///
+    /// This is an alternative to [`Self::post_reorder()`] with a mutable
+    /// reference to the manager as an argument. Since `self` may be a
+    /// substructure of `manager`, the method cannot provide mutable references
+    /// to both `self` and `manager`.
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn post_reorder_mut(manager: &mut M) {}
 }
 
 /// View of a single level in the manager
@@ -824,26 +1075,26 @@ pub unsafe trait LevelView<E: Edge, N: InnerNode<E>> {
     ///
     /// Panics if
     /// - the children of `node` are stored in a different manager, or
-    /// - `N` implements [`HasLevel`] and [`HasLevel::level(node)`] returns a
-    ///   different level.
+    /// - `N` implements [`HasLevel`] and
+    ///   [`HasLevel::level(node)`][HasLevel::level()] returns a different
+    ///   level.
     #[must_use]
     fn get_or_insert(&mut self, node: N) -> AllocResult<E>;
 
     /// Perform garbage collection on this level
     ///
-    /// # Safety
-    ///
-    /// Must be called from inside the closure passed to [`Manager::reorder()`].
-    unsafe fn gc(&mut self);
+    /// This method may be a no-op unless a garbage collection has been
+    /// prepared. For instance, this is what [`Manager::reorder()`] does.
+    fn gc(&mut self);
 
     /// Remove `node` from (this level of) the manager
     ///
-    /// Returns whether the value was present at this level.
+    /// Returns whether the node was present at this level and has been removed.
     ///
-    /// # Safety
-    ///
-    /// Must be called from inside the closure passed to [`Manager::reorder()`].
-    unsafe fn remove(&mut self, node: &N) -> bool;
+    /// This method may be a no-op unless a garbage collection has been
+    /// prepared. For instance, this is what [`Manager::reorder()`] does. In the
+    /// no-op case, the return value is always false.
+    fn remove(&mut self, node: &N) -> bool;
 
     /// Move all nodes from this level to the other level and vice versa.
     ///
@@ -938,12 +1189,12 @@ pub trait HasApplyCache<M: Manager, O: Copy> {
     fn apply_cache_mut(&mut self) -> &mut Self::ApplyCache;
 }
 
-/// [`Manager`] that also has a thread pool
+/// Worker thread pool associated with a [`Manager`]
 ///
 /// A manager having its own thread pool has the advantage that it may use
-/// thread-local storage for its workers to pre-allocate some resources (e.g.
+/// thread-local storage for its workers to pre-allocate some resources (e.g.,
 /// slots for nodes) and thereby reduce lock contention.
-pub trait WorkerManager: Manager + Sync {
+pub trait WorkerPool: Sync {
     /// Get the current number of threads
     fn current_num_threads(&self) -> usize;
 
@@ -976,7 +1227,7 @@ pub trait WorkerManager: Manager + Sync {
     fn broadcast<R: Send>(&self, op: impl Fn(BroadcastContext) -> R + Sync) -> Vec<R>;
 }
 
-/// Context provided to workers by [`WorkerManager::broadcast()`]
+/// Context provided to workers by [`WorkerPool::broadcast()`]
 #[derive(Clone, Copy, Debug)]
 pub struct BroadcastContext {
     /// Index of this worker (in range `0..num_threads`)
@@ -984,4 +1235,14 @@ pub struct BroadcastContext {
 
     /// Number of threads receiving the broadcast
     pub num_threads: u32,
+}
+
+/// Helper trait to be implemented by [`Manager`] and [`ManagerRef`] if they
+/// feature a [`WorkerPool`].
+pub trait HasWorkers: Sync {
+    /// Type of the worker pool
+    type WorkerPool: WorkerPool;
+
+    /// Get the worker pool
+    fn workers(&self) -> &Self::WorkerPool;
 }
