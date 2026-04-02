@@ -447,6 +447,61 @@ impl BDDManager {
     /// Locking behavior: acquires the manager's lock for shared access.
     ///
     /// Args:
+    ///     path_dddmp (str | PathLike[str]): Path of the output dddmp file. If a file at
+    ///         ``path`` exists, it will be overwritten, otherwise a new one
+    ///         will be created.
+    ///     path_colors (str | PathLike[str]): Path of the output colors file. If a file at
+    ///         ``path`` exists, it will be overwritten, otherwise a new one
+    ///         will be created.
+    ///     functions (Iterable[BDDFunction]): Functions to export (must be
+    ///         stored in this manager).
+    ///     colors (Iterable[tuple[BDDFunction, str]]): Functions to export (must be
+    ///         stored in this manager).
+    ///     version (DDDMPVersion): DDDMP format version to use
+    ///     ascii (bool): If ``True``, ASCII mode will be enforced for the
+    ///         export. By default (and if ``False``), binary mode will be used
+    ///         if supported for the decision diagram kind.
+    ///         Binary mode is currently supported for BCDDs only.
+    ///     strict (bool): If ``True`` (the default), enable `strict mode`_
+    ///     diagram_name (str): Name of the decision diagram
+    ///
+    /// Returns:
+    ///     None
+    ///
+    /// .. _`strict mode`: https://docs.rs/oxidd-dump/latest/oxidd_dump/dddmp/struct.ExportSettings.html#method.strict
+    #[pyo3(
+        signature = (/, path_dddmp, path_colors, functions, colors, *, version=None, ascii=false, strict=true, diagram_name=""),
+        text_signature = "($self, /, path_dddmp, path_colors, functions, colors, *, version=DDDMPVersion.V2_0, ascii=False, strict=True, diagram_name=\"\")"
+    )]
+    fn export_colored_dddmp<'py>(
+        &self,
+        path_dddmp: PathBuf,
+        path_colors: PathBuf,
+        functions: &Bound<'py, PyAny>,
+        colors: &Bound<'py, PyAny>,
+        version: Option<&Bound<'py, PyAny>>,
+        ascii: bool,
+        strict: bool,
+        diagram_name: &str,
+    ) -> PyResult<()> {
+        crate::util::export_colored_dddmp::<BDDFunction>(
+            &self.0,
+            &path_dddmp,
+            &path_colors,
+            functions,
+            colors,
+            version,
+            ascii,
+            strict,
+            diagram_name,
+        )
+    }
+
+    /// Export the given decision diagram functions as DDDMP file.
+    ///
+    /// Locking behavior: acquires the manager's lock for shared access.
+    ///
+    /// Args:
     ///     path (str | PathLike[str]): Path of the output file. If a file at
     ///         ``path`` exists, it will be overwritten, otherwise a new one
     ///         will be created.

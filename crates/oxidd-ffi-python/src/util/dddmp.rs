@@ -308,6 +308,49 @@ where
     iter.err
 }
 
+pub fn export_colored_dddmp<'py, PYF>(
+    manager_ref: &<PYF::Target as Function>::ManagerRef,
+    path_dddmp: &Path,
+    path_colors: &Path,
+    functions: &Bound<'py, PyAny>,
+    colors: &Bound<'py, PyAny>,
+    version: Option<&Bound<'py, PyAny>>,
+    ascii: bool,
+    strict: bool,
+    diagram_name: &str,
+) -> PyResult<()>
+where
+    PYF: FromPyObjectOwned<'py> + Deref,
+    PYF::Target: Function,
+    for<'id> INodeOfFunc<'id, PYF::Target>: HasLevel,
+    for<'id> TermOfFunc<'id, PYF::Target>: oxidd_dump::AsciiDisplay,
+{
+    let version = dddmp_version_or_default(version)?;
+    let file_dddmp = std::fs::File::create(path_dddmp)?;
+    let file_colors = std::fs::File::create(path_colors)?;
+
+    let mut functions_iter = super::TryIter::<PYF>::try_from(functions)?;
+    let mut colors_iter = super::FuncStrPairIter::<PYF>::try_from(colors)?;
+    manager_ref.with_manager_shared(|manager| {
+        let settings = dddmp::ExportSettings::default();
+        let settings = if ascii { settings.ascii() } else { settings };
+        settings
+            .diagram_name(diagram_name)
+            .strict(strict)
+            .version(version)
+            .export_with_colors(
+                std::io::BufWriter::new(file_dddmp),
+                std::io::BufWriter::new(file_colors),
+                manager,
+                &mut functions_iter,
+                &mut colors_iter,
+            )?;
+        Ok::<_, PyErr>(())
+    })?;
+    functions_iter.err?;
+    colors_iter.err
+}
+
 pub fn export_dddmp_with_names<'py, PYF>(
     manager_ref: &<PYF::Target as Function>::ManagerRef,
     path: &Path,

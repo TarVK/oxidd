@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
 
@@ -221,7 +221,101 @@ impl<'a> ExportSettings<'a> {
         let mut roots = EdgeVecDropGuard::new(manager, Vec::with_capacity(iter.size_hint().0));
         roots.extend(iter.map(|f| manager.clone_edge(f.as_edge(manager))));
 
-        export_common(file, self, manager, &roots, None)
+        export_common(file, self, manager, &roots, None, None)?;
+        Ok(())
+    }
+
+    /// Export the decision diagram to `file_dddmp`, and node colors to `file_colors`
+    ///
+    /// `functions` is an iterator over (references to) [`Function`]s. All nodes
+    /// reachable from the root nodes of these functions will be included in the
+    /// dump.
+    ///
+    /// `colors` is an iterator over pairs of (references to) [`Function`]s
+    /// and hex colors including a hashtag for coloring in the output diagram.
+    ///
+    /// Use [`Self::export_with_names()`] if you wish to assign names to the
+    /// functions.
+    ///
+    /// Returns an error in case of an I/O failure or if
+    /// [strict mode][Self::strict()] is enabled and the diagram name or a
+    /// variable name does not meet the [requirements][Self::strict()]. In case
+    /// one of the strict mode requirements is violated, the implementation
+    /// attempts to complete the export before reporting the error. This is to
+    /// help inspecting the error and also to save a checkpoint for very
+    /// long-running computations.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use oxidd_core::function::{self, Function};
+    /// # use oxidd_dump::dddmp::ExportSettings;
+    /// # fn export<F: Function>(f: &F, g: &F, h: &F) -> std::io::Result<()>
+    /// # where
+    /// #    for<'id> function::INodeOfFunc<'id, F>: oxidd_core::HasLevel,
+    /// #    for<'id> function::TermOfFunc<'id, F>: oxidd_dump::AsciiDisplay,
+    /// # {
+    /// let file = std::fs::File::create("foo.dddmp")?;
+    /// f.with_manager_shared(|manager, _| {
+    ///     ExportSettings::default()
+    ///         .diagram_name("foo")
+    ///         .export(file, manager, [f, g, h])
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn export_with_colors<'id, FR: std::ops::Deref, D: fmt::Display>(
+        &self,
+        file_dddmp: impl io::Write,
+        mut file_colors: impl io::Write,
+        manager: &<FR::Target as Function>::Manager<'id>,
+        functions: impl IntoIterator<Item = FR>,
+        colors: impl IntoIterator<Item = (FR, D)>,
+    ) -> io::Result<()>
+    where
+        FR::Target: Function,
+        INodeOfFunc<'id, FR::Target>: HasLevel,
+        TermOfFunc<'id, FR::Target>: AsciiDisplay,
+    {
+        let root_iter = functions.into_iter();
+        let mut roots = EdgeVecDropGuard::new(manager, Vec::with_capacity(root_iter.size_hint().0));
+        roots.extend(root_iter.map(|f| manager.clone_edge(f.as_edge(manager))));
+
+        let colors_iter = colors.into_iter();
+        let mut colors_functions =
+            EdgeVecDropGuard::new(manager, Vec::with_capacity(colors_iter.size_hint().0));
+        let mut colors_hexes = Vec::<String>::with_capacity(1024);
+
+        let mut res = Ok(());
+
+        for (func, color) in colors_iter {
+            colors_functions.push(manager.clone_edge(func.as_edge(manager)));
+
+            let color = format!("{color}");
+            if !is_valid_hex_color(&color) && self.strict && res.is_ok() {
+                res = Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "colors must be valid hex colors of the form: #RRGGBB",
+                ));
+            }
+            colors_hexes.push(color);
+        }
+
+        let ids = export_common(
+            file_dddmp,
+            self,
+            manager,
+            &roots,
+            None,
+            Some(&colors_functions),
+        )?;
+        for (id, color) in ids.iter().zip(colors_hexes) {
+            if let Some(id) = id {
+                writeln!(file_colors, "{id} {color}")?;
+            }
+        }
+
+        res
     }
 
     /// Create a new export with function names
@@ -314,40 +408,41 @@ impl<'a> ExportSettings<'a> {
             }
         }
 
-        export_common(file, self, manager, &roots, Some(&root_names))?;
+        export_common(file, self, manager, &roots, Some(&root_names), None)?;
         res
     }
 }
 
 fn export_common<M: Manager, W: io::Write>(
-    mut file: W,
+    mut file_dddmp: W,
     settings: &ExportSettings,
     manager: &M,
     roots: &[M::Edge],
     root_names: Option<&[u8]>,
-) -> io::Result<()>
+    func_ids: Option<&[M::Edge]>,
+) -> io::Result<Vec<Option<usize>>>
 where
     M::InnerNode: HasLevel,
     M::Terminal: crate::AsciiDisplay,
 {
-    writeln!(file, ".ver {}", settings.version)?;
+    writeln!(file_dddmp, ".ver {}", settings.version)?;
     let ascii = settings.ascii || !ExportSettings::binary_supported(manager);
-    writeln!(file, ".mode {}", if ascii { 'A' } else { 'B' })?;
+    writeln!(file_dddmp, ".mode {}", if ascii { 'A' } else { 'B' })?;
 
     // TODO: other .varinfo modes?
-    writeln!(file, ".varinfo {}", VarInfo::None as u32)?;
+    writeln!(file_dddmp, ".varinfo {}", VarInfo::None as u32)?;
 
     let mut res = Ok(());
 
     if !settings.diagram_name.is_empty() {
-        write!(file, ".dd ")?;
-        if write_replacing_control(&mut file, settings.diagram_name)? && settings.strict {
+        write!(file_dddmp, ".dd ")?;
+        if write_replacing_control(&mut file_dddmp, settings.diagram_name)? && settings.strict {
             res = Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "decision diagram name must not contain control characters",
             ));
         }
-        writeln!(file)?;
+        writeln!(file_dddmp)?;
     }
 
     let nvars = manager.num_levels();
@@ -410,9 +505,9 @@ where
             *idx = nnodes;
         }
     }
-    writeln!(file, ".nnodes {nnodes}")?;
-    writeln!(file, ".nvars {nvars}")?;
-    writeln!(file, ".nsuppvars {nsuppvars}")?;
+    writeln!(file_dddmp, ".nnodes {nnodes}")?;
+    writeln!(file_dddmp, ".nvars {nvars}")?;
+    writeln!(file_dddmp, ".nsuppvars {nsuppvars}")?;
 
     if manager.num_named_vars() == nvars || (!settings.strict && manager.num_named_vars() != 0) {
         let mut leading_underscores = 1;
@@ -460,44 +555,44 @@ where
         };
 
         if let DDDMPVersion::V3_0 = settings.version {
-            write!(file, ".varnames")?;
+            write!(file_dddmp, ".varnames")?;
             for var in 0..nvars {
-                write_var(&mut file, var as usize)?;
+                write_var(&mut file_dddmp, var as usize)?;
             }
-            writeln!(file)?;
+            writeln!(file_dddmp)?;
         }
 
-        write!(file, ".suppvarnames")?;
+        write!(file_dddmp, ".suppvarnames")?;
         for var in 0..nvars {
             if supp_levels.contains(manager.var_to_level(var) as usize) {
-                write_var(&mut file, var as usize)?;
+                write_var(&mut file_dddmp, var as usize)?;
             }
         }
-        writeln!(file)?;
+        writeln!(file_dddmp)?;
 
-        write!(file, ".orderedvarnames")?;
+        write!(file_dddmp, ".orderedvarnames")?;
         for level in 0..nvars {
-            write_var(&mut file, manager.level_to_var(level) as usize)?;
+            write_var(&mut file_dddmp, manager.level_to_var(level) as usize)?;
         }
-        writeln!(file)?;
+        writeln!(file_dddmp)?;
     }
 
-    write!(file, ".ids")?;
+    write!(file_dddmp, ".ids")?;
     for id in 0..nvars {
         if supp_levels.contains(manager.var_to_level(id) as usize) {
-            write!(file, " {id}")?;
+            write!(file_dddmp, " {id}")?;
         }
     }
-    writeln!(file)?;
+    writeln!(file_dddmp)?;
 
-    write!(file, ".permids")?;
+    write!(file_dddmp, ".permids")?;
     for var in 0..nvars {
         let level = manager.var_to_level(var);
         if supp_levels.contains(level as usize) {
-            write!(file, " {level}")?;
+            write!(file_dddmp, " {level}")?;
         }
     }
-    writeln!(file)?;
+    writeln!(file_dddmp)?;
 
     // TODO: .auxids?
 
@@ -535,24 +630,36 @@ where
         }
     };
 
-    writeln!(file, ".nroots {}", roots.len())?;
-    write!(file, ".rootids")?;
+    writeln!(file_dddmp, ".nroots {}", roots.len())?;
+    write!(file_dddmp, ".rootids")?;
     for root in roots {
-        write!(file, " {}", idx(root))?;
+        write!(file_dddmp, " {}", idx(root))?;
     }
-    writeln!(file)?;
+    writeln!(file_dddmp)?;
     if let Some(root_names) = root_names {
-        write!(file, ".rootnames")?;
-        file.write_all(root_names)?;
-        writeln!(file)?;
+        write!(file_dddmp, ".rootnames")?;
+        file_dddmp.write_all(root_names)?;
+        writeln!(file_dddmp)?;
     }
 
-    writeln!(file, ".nodes")?;
+    writeln!(file_dddmp, ".nodes")?;
 
     #[inline]
     const fn node_code(var: Code, t: Code, e_complement: bool, e: Code) -> u8 {
         ((var as u8) << 5) | ((t as u8) << 3) | ((e_complement as u8) << 2) | e as u8
     }
+
+    let mut out_ids: Vec<Option<usize>> = (0..func_ids.map(|f| f.len()).unwrap_or_default())
+        .map(|_| None)
+        .collect();
+    let out_index_map = func_ids
+        .map(|f| {
+            f.iter()
+                .enumerate()
+                .map(|(id, e)| (e, id))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
 
     let mut exported_nodes = 0;
     for (edge, &node_id) in terminal_map.iter() {
@@ -565,26 +672,32 @@ where
             // <Else-index>
             let node = manager.get_node(edge);
             let desc = Ascii(node.unwrap_terminal());
-            writeln!(file, "{node_id} {desc} 0 0")?;
+            writeln!(file_dddmp, "{node_id} {desc} 0 0")?;
+            if let Some(&index) = out_index_map.get(edge) {
+                out_ids[index] = Some(node_id);
+            }
         } else {
             let terminal = node_code(Code::Terminal, Code::Terminal, false, Code::Terminal);
-            write_escaped(&mut file, &[terminal])?;
+            write_escaped(&mut file_dddmp, &[terminal])?;
         }
         exported_nodes += 1;
     }
     // Work from bottom to top
     for &(var_idx, ref level) in node_map.iter().rev() {
         for (e, &node_id) in level.iter() {
+            if let Some(&index) = out_index_map.get(e) {
+                out_ids[index] = Some(node_id);
+            }
             assert_eq!(exported_nodes + 1, node_id);
             let node = manager.get_node(e).unwrap_inner();
             if ascii {
                 // <Node-index> [<Var-extra-info>] <Var-internal-index> <Then-index>
                 // <Else-index>
-                write!(file, "{node_id} {var_idx}")?;
+                write!(file_dddmp, "{node_id} {var_idx}")?;
                 for child in node.children() {
-                    write!(file, " {}", idx(&child))?;
+                    write!(file_dddmp, " {}", idx(&child))?;
                 }
-                writeln!(file)?;
+                writeln!(file_dddmp)?;
             } else {
                 let mut iter = node.children();
                 let t = iter.next().unwrap();
@@ -611,26 +724,27 @@ where
 
                 debug_assert!(!is_complemented(&*t));
                 write_escaped(
-                    &mut file,
+                    &mut file_dddmp,
                     &[node_code(var_code, t_code, is_complemented(&*e), e_code)],
                 )?;
                 if var_code == Code::AbsoluteID || var_code == Code::RelativeID {
-                    encode_7bit(&mut file, var_idx as usize)?;
+                    encode_7bit(&mut file_dddmp, var_idx as usize)?;
                 }
                 if t_code == Code::AbsoluteID || t_code == Code::RelativeID {
-                    encode_7bit(&mut file, t_idx)?;
+                    encode_7bit(&mut file_dddmp, t_idx)?;
                 }
                 if e_code == Code::AbsoluteID || e_code == Code::RelativeID {
-                    encode_7bit(&mut file, e_idx)?;
+                    encode_7bit(&mut file_dddmp, e_idx)?;
                 }
             }
             exported_nodes += 1;
         }
     }
 
-    writeln!(file, ".end")?;
+    writeln!(file_dddmp, ".end")?;
 
-    res
+    res?;
+    Ok(out_ids)
 }
 
 struct Ascii<T>(T);
@@ -710,6 +824,16 @@ fn write_escaped(mut writer: impl io::Write, buf: &[u8]) -> io::Result<()> {
         })?;
     }
     Ok(())
+}
+
+fn is_valid_hex_color(s: &str) -> bool {
+    let chars = s.as_bytes();
+
+    if chars.len() != 7 || chars[0] != b'#' {
+        return false;
+    }
+
+    chars[1..].iter().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]

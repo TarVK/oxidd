@@ -31,28 +31,31 @@ OXIDD_PYFFI_LINK_MODE=static python -m pip install "oxidd @ git+https://git@gith
 
 Of course if you have pip installed on its own, you might need to omit "python -m" from the command, or if Python is called differently (e.g. "py" or "python3") you will need to use the name instead.
 
-After successful installation, Python bindings should be available. With the visualization tool is running, you should now be able to execute scripts with visualization calls:
+After successful installation, Python bindings should be available.
+You should now be able to export dddmp with a colors file as follows:
 
 ```py
-import oxidd
-from oxidd.protocols import (
-    BooleanFunction,
-    BooleanFunctionManager,
-    BooleanFunctionQuant,
-    FunctionSubst,
-)
-from oxidd.util import BooleanOperator
+from oxidd.bdd import BDDManager
 
-mgr = oxidd.bdd.BDDManager(1024, 1024, 1)
-x = mgr.new_var("x")
-y = mgr.new_var("y")
-z = mgr.new_var("z")
-w = mgr.new_var("w")
-f = x & y & ~z & w
-mgr.visualize([("f", f), ("z_&_w", z & w)]) # Send to visualization tool
-mgr.export_dot("test.dot", [("f", f)]) # Export as dot file
-mgr.export_dddmp("test.dddmp", [("w", w)]) # Export as dddmp file
+mgr = BDDManager(1024, 1024, 1)
+mgr.add_named_vars(["x","y","z"])
+x = mgr.var(0)
+y = mgr.var(1)
+z = mgr.var(2)
+f = x.imp(y & z)
+mgr.export_colored_dddmp(
+    "./out/data.dddmp",
+    "./out/data.colors",
+    [f],
+    [
+        (y & z, "#ff0000"),
+        (f, "#ff00ff"),
+        (x, "#00ff00") # Note, this does not occur in f
+    ]
+)
 ```
+
+The OxiDD-vis on the [feature-node-colors](https://github.com/OxiDD/oxidd-vis/tree/feature-node-colors) branch should be able to visualize BDDs with this color information.
 
 ### Rust
 
