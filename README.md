@@ -17,16 +17,10 @@ There are several dependencies for this to work, that you have have to install:
 
 Besides this, you might need to create and activate a [virtual Python environment](https://www.freecodecamp.org/news/how-to-setup-virtual-environments-in-python/).
 
-Install the Python bindings present in this fork on Windows with the command:
+Install the Python bindings present in this fork with the command:
 
 ```txt
-python -m pip install "oxidd @ git+https://git@github.com/TarVK/oxidd.git"
-```
-
-On Mac or Linux instead use:
-
-```txt
-OXIDD_PYFFI_LINK_MODE=static python -m pip install "oxidd @ git+https://git@github.com/TarVK/oxidd.git"
+python -m pip install "git+https://git@github.com/TarVK/oxidd@feature/color-export"
 ```
 
 Of course if you have pip installed on its own, you might need to omit "python -m" from the command, or if Python is called differently (e.g. "py" or "python3") you will need to use the name instead.
