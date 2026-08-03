@@ -22,6 +22,7 @@ use crate::AsciiDisplay;
 pub struct Visualizer {
     port: u16,
     buf: Vec<u8>,
+    // awaiting_finish: bool,
 }
 
 impl Default for Visualizer {
@@ -227,9 +228,31 @@ impl Visualizer {
     /// Returns `Ok(true)` if the visualization has been sent, `Ok(false)` if
     /// request is for a path different from `/diagrams`
     fn handle_req(&mut self, stream: &mut HttpStream) -> io::Result<bool> {
-        // Basic routing: only handle "GET /diagrams"
-        // After the path, there should be "HTTP/1.1" (or something alike),
-        // so expecting the space is fine.
+        // // Basic routing: only handle "GET /diagrams" and "GET /diagrams/finished"
+        // // After the path, there should be "HTTP/1.1" (or something alike),
+        // // so expecting the space is fine.
+        // if stream.next_request_starts_with(b"GET /diagrams/finished ")? {
+        //     write!(
+        //         stream.conn,
+        //         "HTTP/1.1 200 OK\r\n\
+        //         Content-Type: application/json\r\n\
+        //         Content-Length: {len}\r\n\
+        //         Access-Control-Allow-Origin: *\r\n\ "
+        //     )?;
+        //     self.awaiting_finish = false
+        //     Ok(true)
+        // }
+        // if self.awaiting_finish {
+        //     stream.conn.write_all(
+        //         b"HTTP/1.1 423: LOCKED\r\n\
+        //         Content-Type: text/plain\r\n\
+        //         Content-Length: 9\r\n\
+        //         Access-Control-Allow-Origin: *\r\n\
+        //         \r\n\
+        //         Waiting for /diagrams/finished to be called first",
+        //     )?;
+        // }
+
         if !stream.next_request_starts_with(b"GET /diagrams ")? {
             stream.conn.write_all(
                 b"HTTP/1.1 404 NOT FOUND\r\n\
